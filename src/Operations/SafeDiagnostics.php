@@ -6,10 +6,14 @@ namespace RadioStamp\Operations;
 final class SafeDiagnostics
 {
     private const STAGES=['http_prepare','http_controller','http_action','http_queue','ack_emit','ack_finish','after_response',
-        'worker_claim','worker_result','followup','cycle','session','member_pending','rest','rest_exception','roster','member_guard','ack_handoff'];
+        'worker_claim','worker_result','followup','cycle','session','member_pending','rest','rest_exception','roster','member_guard','ack_handoff','weekly_ranking'];
     private const ACTIONS=['receipt','attend','card','status','start','memorial','check'];
     private const ROUTES=['identity','gateway','voice_read','member_write','room_read','room_write','message','followup','other'];
     private const CODES=[
+        'weekly_ranking_disabled','weekly_ranking_not_due','weekly_ranking_skipped','weekly_ranking_complete',
+        'weekly_ranking_held','weekly_ranking_retry_wait','weekly_ranking_retry_pending','weekly_ranking_retry_exhausted',
+        'weekly_ranking_part_sent','weekly_ranking_deferred','weekly_ranking_unavailable',
+        'weekly_ranking_expired','weekly_ranking_configuration_unavailable',
         'other_code','exception','parsed','config_ready','operations_unavailable','response_prepared','emitted','finished','unavailable',
         'administrator_validation_unavailable','method_not_allowed','request_too_large','invalid_signature','invalid_json',
         'wrong_application','administrator_scope_required','wrong_channel','invalid_interaction','unsupported_action',

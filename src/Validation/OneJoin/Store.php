@@ -72,6 +72,8 @@ final class Store
     }
 
     public static function exists(string $privateBase): bool { return file_exists(rtrim($privateBase, '/\\') . '/instances/' . Trial::NAME); }
+    /** Nonsecret activation is already bound to this isolated store's marker/state. */
+    public function activation(): array { return $this->activation; }
     public function state(): array { return json_decode((string)$this->db->pdo()->query('SELECT data FROM trial_meta WHERE id=1')->fetchColumn(), true, 16, JSON_THROW_ON_ERROR); }
     public function update(\Closure $change): mixed
     {

@@ -7,3 +7,6 @@ Run the 36 test groups with `php tests/run.php`. They use fictional signed reque
 This clean source export includes only the pure PHP fixture code needed by the current suite. Disabled activation is fictional. Role names, IDs, and permission observations in the runtime fixture are generated from fictional configured scope and policy; no historical guild observations are bundled.
 
 The original local audit contained 43 additional checks that verified old, private image/archive bytes: 13 in the placeholder-card group and 30 in the stamp-rendering group. Those local preservation checks are intentionally excluded here because the owner archive and its manifests are not exported. Current card pixels, layouts, ordering, counts, resource bounds, runtime behavior, recovery, and qualification checks remain. The source owner retains the original audit separately.
+# 最新の焦点検証（2026-10-21）
+
+現在のrun.phpは40群を登録しています。今回の更新では、全件の重複実行を避け、one_join_scoped_permissions.php / weekly_ranking.php / opening_notice.php / prelaunch_gate.php / production_parity.php の5群を両SQLiteで確認しました。内訳と過去の全体検証を区別した結果は [VALIDATION](../docs/VALIDATION.md) にあります。実通信/実参加記録を使わず、出力はREADMEの手順でリポジトリ外へ置きます。

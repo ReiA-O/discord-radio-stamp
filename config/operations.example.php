@@ -14,6 +14,7 @@ return array_replace($base,[
     'roles_enabled'=>false,'achievement_notifications_enabled'=>false,'role_ids'=>[],
     'closure_policy'=>'manual','member_actions_enabled'=>false,'accept_voice_race_risk'=>false,
     'periodic_worker_enabled'=>false,'command_registration_enabled'=>false,
+    'weekly_ranking_enabled'=>false, // Explicit opt-in after a separate deployment/start decision.
     'private_db_path'=>dirname(__DIR__).'/var-private/operations.sqlite',
     'private_root'=>dirname(__DIR__).'/var-private',
     'entry_instructions'=>'体操後に /radio-attend → 共有の参加ボタンを各自で押す',

@@ -19,6 +19,7 @@ use RadioStamp\Discord\DayAchievementGateway;
 use RadioStamp\Discord\ReceiptMessage;
 use RadioStamp\Discord\{ReceiptGateway,RoleGateway,BestEffortMemberGateway,ServerOperationsGateway};
 use RadioStamp\Discord\{DeliveryAwareGateway,TransportOutcome};
+use RadioStamp\Discord\{OpeningNoticeGateway,OpeningNoticeMessage};
 use RadioStamp\Operations\OperationsConfig;
 
 final class RadioService
@@ -146,6 +147,7 @@ final class RadioService
     public function start(string $sessionId, string $userId, string $interactionId): array
     {
         if (!$this->validationUserAllowed($userId)) { return $this->result(false, 'admin_validation_forbidden'); }
+        if($this->schedule->isBeforeStart($sessionId)){return $this->result(false,'session_before_launch');}
         if(($replay=$this->interactionReplay('start',$sessionId,$userId,$interactionId))!==null){return $replay;}
         if (!$this->adminValidationMode && !$this->schedule->contains($sessionId)) { return $this->result(false,'session_not_found'); }
         if ($this->config['participant_commands_enabled']) { return $this->result(false, 'use_receipt_command'); }
@@ -190,6 +192,7 @@ final class RadioService
         if ($replay !== false) {
             if ($replay['operation'] !== 'receipt' || $replay['user_id'] !== $userId) { return $this->result(false, 'interaction_conflict'); }
             $result = json_decode($replay['result_json'],true,32,JSON_THROW_ON_ERROR);
+            if($this->schedule->isBeforeStart((string)($result['session_id']??''))){return $this->result(false,'session_before_launch');}
             return ($result['ok'] ?? false) ? $this->receiptResponse($result) : $result;
         }
         $requestedAt ??= $this->now();
@@ -275,6 +278,7 @@ final class RadioService
     public function attend(string $sessionId, string $userId, string $interactionId): array
     {
         if (!$this->validationUserAllowed($userId)) { return $this->result(false, 'admin_validation_forbidden'); }
+        if($this->schedule->isBeforeStart($sessionId)){return $this->result(false,'session_before_launch');}
         if(($replay=$this->interactionReplay('attend',$sessionId,$userId,$interactionId))!==null){return $replay;}
         if (!$this->adminValidationMode && !$this->schedule->contains($sessionId)) { return $this->result(false,'session_not_found'); }
         if ($this->adminValidationMode && ($preparation = $this->prepareValidationSession($sessionId)) !== null) { return $preparation; }
@@ -377,6 +381,8 @@ final class RadioService
     {
         $initial=$this->session($this->db->pdo(),$id);
         if($initial===null||$initial['status']==='closed'){return $this->result(true,'closed',['session_id'=>$id]);}
+        // Preserve pre-launch history/plans verbatim, including pending receipts and effects.
+        if($this->schedule->isBeforeStart($id)){return $this->result(true,'session_before_launch',['session_id'=>$id]);}
         if ($this->config['participant_commands_enabled'] && $initial['started_at']!==null && (int)$initial['closes_at']<=$this->now()) {
             // A2's definite no-send expiry is local bookkeeping, even when an old window conflicts.
             $this->flushReceiptAnnouncement($id);
@@ -577,8 +583,10 @@ final class RadioService
                         && $scheduled->getTimestamp()+1800>$now && $this->session($pdo,$scheduled->format('Y-m-d_Hi'))===null) { return true; }
                 }
             }
-            $query=$pdo->prepare("SELECT 1 FROM sessions WHERE id!=? AND status!='closed' AND opens_at<? AND COALESCE(closes_at,unstarted_closes_at)>CAST(? AS INTEGER) LIMIT 1");
-            $query->execute([$session['id'],$due,$now]);
+            $sql="SELECT 1 FROM sessions WHERE id!=? AND status!='closed' AND opens_at<? AND COALESCE(closes_at,unstarted_closes_at)>CAST(? AS INTEGER)";
+            $params=[$session['id'],$due,$now];$first=$this->schedule->firstSessionAt();
+            if($first!==null){$sql.=' AND scheduled_at>=?';$params[]=$first;}
+            $query=$pdo->prepare($sql.' LIMIT 1');$query->execute($params);
         }
         return $query->fetchColumn()!==false;
     }
@@ -590,7 +598,9 @@ final class RadioService
         $id = $session['id'];
         $this->enqueueEffect($pdo, 'open-room:' . $id, 'room_open', ['session_id' => $id]);
         $this->enqueueEffect($pdo, 'guide:' . $id, 'guide', ['session_id' => $id]);
-        if ($this->now() >= (int)$session['opens_at'] && $this->now() < (int)$session['scheduled_at']) {
+        if($this->operationsMode){
+            $this->enqueueEffect($pdo,OpeningNoticeMessage::key($id),'opening_notice',OpeningNoticeMessage::snapshot($session),(int)$session['scheduled_at']);
+        }elseif ($this->now() >= (int)$session['opens_at'] && $this->now() < (int)$session['scheduled_at']) {
             $this->enqueueEffect($pdo, 'reminder:' . $id, 'reminder', ['session_id' => $id], (int)$session['scheduled_at']);
         }
         if ($session['status'] === 'planned') { $pdo->prepare("UPDATE sessions SET status='open' WHERE id=?")->execute([$id]); }
@@ -602,13 +612,15 @@ final class RadioService
         $session = $this->session($this->db->pdo(), $id);
         if ($session === null || in_array($session['status'], ['closed', 'closing'], true)) { return true; }
         $reminder = true;
-        if ($this->now() >= (int)$session['opens_at'] && $this->now() < (int)$session['scheduled_at']) {
+        if (!$this->operationsMode && $this->now() >= (int)$session['opens_at'] && $this->now() < (int)$session['scheduled_at']) {
             $scheduled = (new DateTimeImmutable('@' . $session['scheduled_at']))->setTimezone($this->timezone);
             $content = "あと30分でラジオ体操だよー！⚡\n予定時刻: " . $scheduled->format('Y-m-d H:i') . ' JST';
             $reminder = $this->dispatch('reminder:' . $id, fn(string $key) => $this->discord->sendMessage($this->config['text_channel_id'], $content, $key));
         }
         $opened = $this->dispatch('open-room:' . $id, fn(string $key) => $this->discord->setRoomOpen($this->config['voice_channel_id'], true, $key));
         if (!$opened) { return false; }
+        // Notification failure/hold must not prevent the existing VC guide or participant flow.
+        if($this->operationsMode){$this->flushOpeningNotice($id);}
         if ($this->config['participant_commands_enabled']) {
             if ($session['started_at'] !== null) { return $reminder; }
             $guide=$this->dispatch('guide:'.$id,fn(string $key)=>$this->discord->sendMessage($this->config['voice_channel_id'],
@@ -619,6 +631,51 @@ final class RadioService
         $guide = $this->dispatch('guide:' . $id, fn(string $key) =>
             $this->discord->sendMessage($this->config['voice_channel_id'], "会場を開きました。動画を開く→再生→体操開始ボタン→参加ボタン\nWatch Together で参加者が手動再生してください。https://www.youtube.com/watch?v=RNlB93CuwOI\n第1・第2を1セットとして、この開催への参加は1回記録できます。", $key, ButtonBuilder::sessionControls($id)));
         return $guide && $reminder;
+    }
+
+    /** pending+non-null owner is in-flight/held forever, never reclaimed by a lease timeout. */
+    private function flushOpeningNotice(string $id):void
+    {
+        if(!$this->operationsMode||!$this->discord instanceof OpeningNoticeGateway){return;}
+        $key=OpeningNoticeMessage::key($id);$owner=bin2hex(random_bytes(16));
+        try{
+            $peek=$this->session($this->db->pdo(),$id);$now=$this->now();
+            if($peek===null||in_array($peek['status'],['planned','closing','closed'],true)||$now<(int)$peek['scheduled_at']-600||$now>=(int)$peek['scheduled_at']){return;}
+            $q=$this->db->pdo()->prepare('SELECT status,cancelled_at,lease_owner,attempts,lease_until FROM core_effects WHERE effect_key=?');$q->execute([$key]);$pending=$q->fetch();$q->closeCursor();
+            if($pending===false||$pending['status']!=='pending'||$pending['cancelled_at']!==null||$pending['lease_owner']!==null||(int)$pending['attempts']>=5||(int)$pending['lease_until']>$now){return;}
+            // A closed/unverifiable room keeps its notification pending without spending send attempts.
+            if(!$this->discord->openingRoomVerified()){return;}
+            $snapshot=$this->db->transaction(function(PDO $pdo)use($id,$key,$owner):?array{
+                $session=$this->session($pdo,$id);$now=$this->now();
+                if($session===null||in_array($session['status'],['planned','closing','closed'],true)||$this->sessionBindingError($session)!==null
+                    ||$this->sessionScheduleConflict($pdo,$session,$now)||$now<(int)$session['scheduled_at']-600||$now>=(int)$session['scheduled_at']){return null;}
+                $q=$pdo->prepare('SELECT * FROM core_effects WHERE effect_key=?');$q->execute([$key]);$effect=$q->fetch();$q->closeCursor();
+                if($effect===false||$effect['kind']!=='opening_notice'||$effect['status']!=='pending'||$effect['cancelled_at']!==null
+                    ||$effect['lease_owner']!==null||(int)$effect['attempts']>=5||(int)$effect['lease_until']>$now
+                    ||(int)$effect['expires_at']!==(int)$session['scheduled_at']){return null;}
+                $snapshot=OpeningNoticeMessage::snapshot($session);
+                if(json_decode($effect['payload_json'],true,32,JSON_THROW_ON_ERROR)!==$snapshot){return null;}
+                $q=$pdo->prepare("SELECT 1 FROM core_effects WHERE effect_key=? AND kind='room_open' AND status='done' AND cancelled_at IS NULL");$q->execute(['open-room:'.$id]);$opened=$q->fetchColumn()!==false;$q->closeCursor();if(!$opened){return null;}
+                // A previous-version reminder might already have arrived. Preserve it; do not add another message.
+                $q=$pdo->prepare('SELECT status,attempts,last_attempt_at FROM core_effects WHERE effect_key=?');$q->execute(['reminder:'.$id]);$legacy=$q->fetch();$q->closeCursor();
+                if($legacy!==false&&($legacy['status']==='done'||(int)$legacy['attempts']>0||$legacy['last_attempt_at']!==null)){
+                    $pdo->prepare('UPDATE core_effects SET lease_owner=?,lease_until=0 WHERE effect_key=? AND lease_owner IS NULL')->execute([$owner,$key]);return null;
+                }
+                $q=$pdo->prepare('UPDATE core_effects SET lease_owner=?,lease_until=0,attempts=attempts+1,last_attempt_at=? WHERE effect_key=? AND lease_owner IS NULL');$q->execute([$owner,$now,$key]);
+                return $q->rowCount()===1?$snapshot:null;
+            });
+            if($snapshot===null){return;}
+            $delivery=$this->discord->sendOpeningNoticeResult($snapshot,$key);
+            $success=$delivery->ok&&$delivery->outcome===TransportOutcome::Succeeded
+                &&is_string($delivery->data['message_id']??null)&&preg_match('/\A[1-9][0-9]{16,19}\z/D',$delivery->data['message_id'])===1;
+            if(!$success&&!$delivery->outcome->retryable()){return;} // Keep the owner: possibly delivered, never resend.
+            $this->db->transaction(function(PDO $pdo)use($key,$owner,$delivery,$success):void{
+                $q=$pdo->prepare('SELECT attempts FROM core_effects WHERE effect_key=? AND lease_owner=?');$q->execute([$key,$owner]);$attempts=$q->fetchColumn();$q->closeCursor();if($attempts===false){return;}
+                $delay=max(min(3600,(int)ceil($delivery->retryAfter??0)),5*(2**max(0,(int)$attempts-1)));
+                $q=$pdo->prepare("UPDATE core_effects SET status=?,completed_at=?,lease_owner=NULL,lease_until=?,cancelled_at=CASE WHEN ? THEN ? ELSE cancelled_at END WHERE effect_key=? AND lease_owner=? AND status='pending' AND cancelled_at IS NULL");
+                $q->execute([$success?'done':'pending',$success?$this->now():null,$success?0:$this->now()+$delay,!$success&&(int)$attempts>=5?1:0,$this->now(),$key,$owner]);
+            });
+        }catch(\Throwable){/* A send/save exception leaves the owner as an explicit hold; a failed preclaim made no request. */}
     }
 
     private function syncRoles(): void
@@ -760,9 +817,24 @@ final class RadioService
     {
         $this->db->transaction(function (PDO $pdo): void {
             $now = $this->now();
+            if($this->schedule->firstSessionAt()!==null){
+                $q=$pdo->prepare("SELECT effect_key,payload_json FROM core_effects WHERE status='pending' AND cancelled_at IS NULL AND expires_at<=?");$q->execute([$now]);$expired=$q->fetchAll();$q->closeCursor();
+                $update=$pdo->prepare("UPDATE core_effects SET cancelled_at=?,lease_until=0,lease_owner=NULL WHERE effect_key=? AND status='pending' AND cancelled_at IS NULL AND expires_at<=?");
+                foreach($expired as$effect){$payload=json_decode($effect['payload_json'],true);$id=is_array($payload)?($payload['session_id']??null):null;
+                    if(is_string($id)&&$this->schedule->isBeforeStart($id)){continue;}$update->execute([$now,$effect['effect_key'],$now]);}
+                return;
+            }
             $pdo->prepare("UPDATE core_effects SET cancelled_at=?,lease_until=0,lease_owner=NULL WHERE status='pending' AND cancelled_at IS NULL AND expires_at<=?")
                 ->execute([$now, $now]);
         });
+    }
+
+    /** Exclude retained pre-launch rows from the cooperative worker's need-to-poll query. */
+    public function scheduledWorkDueBy(int $timestamp):bool
+    {
+        $sql="SELECT 1 FROM sessions WHERE status!='closed' AND opens_at<=?";$params=[$timestamp];$first=$this->schedule->firstSessionAt();
+        if($first!==null){$sql.=' AND scheduled_at>=?';$params[]=$first;}
+        $q=$this->db->pdo()->prepare($sql.' LIMIT 1');$q->execute($params);return $q->fetchColumn()!==false;
     }
 
     /** Claim briefly, release the write lock, then invoke the gateway. No network under SQLite locks. */

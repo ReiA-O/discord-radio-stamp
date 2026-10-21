@@ -2,7 +2,7 @@
 declare(strict_types=1);
 namespace RadioStamp\Operations;
 
-use RadioStamp\Core\{Database,Clock,SystemClock,RadioService};
+use RadioStamp\Core\{Database,Clock,SystemClock,RadioService,WeeklyRanking};
 use RadioStamp\Discord\{HttpAdapter,CurlHttpAdapter,DiscordRestClient,ServerOperationsClient,ServerOperationsGateway,GatewayRosterSession,TlsGatewayTransport,MemberActionFence};
 use RadioStamp\Http\{InteractionQueue,InteractionWorker,DiscordRestFollowupSink};
 use RadioStamp\Cards\CardRenderer;
@@ -28,7 +28,8 @@ final class OperationsRuntime
             'enabled'=>true,'posts_enabled'=>$config['posts_enabled'],'roles_enabled'=>$config['roles_enabled'],
             'room_permissions_enabled'=>$config['room_permissions_enabled'],'room_baseline'=>$config['room_baseline'],
             'commands_enabled'=>$config['command_registration_enabled'],'participant_scope'=>ParticipantScope::mode($config),'member_actions_enabled'=>$config['member_actions_enabled'],
-            'accept_voice_race_risk'=>$config['accept_voice_race_risk'],'role_ids'=>$config['role_ids'],'owner_user_id'=>$config['owner_user_id']??null,'request_guard'=>$guard,'source_guard'=>$sourceGuard,'diagnostics'=>$diagnostics]);
+            'accept_voice_race_risk'=>$config['accept_voice_race_risk'],'role_ids'=>$config['role_ids'],'owner_user_id'=>$config['owner_user_id']??null,'request_guard'=>$guard,'source_guard'=>$sourceGuard,'diagnostics'=>$diagnostics,
+            'weekly_ranking_enabled'=>$config['weekly_ranking_enabled']??false,'weekly_ranking_now'=>fn():int=>$this->clock->now()->getTimestamp()]);
         $session=new GatewayRosterSession($db,$client,$this->clock,$config['bot_token'],$this->transportFactory??static fn()=>new TlsGatewayTransport(),$outerGuard);
         $gateway=new ServerOperationsGateway($client,$this->clock,$config,$session,$diagnostics);$service=new RadioService($db,$gateway,$this->clock,$config);
         $queue=new InteractionQueue($db->pdo(),new TokenCipher($config['token_encryption_key_hex']));
@@ -37,7 +38,8 @@ final class OperationsRuntime
         $followup=new DiscordRestFollowupSink(new DiscordRestClient($http,DiscordRestClient::APPLICATION_ID,$config['bot_token'],$options),$diagnostics);
         $preflight=static function()use($client):array{$ok=$client->identity()->ok;return ['ok'=>$ok,'code'=>$ok?'operations_identity_verified':'validation_bot_identity_unverified'];};
         $worker=new InteractionWorker($queue,$service,static fn()=>new CardRenderer($config['font_candidates']),$followup,$this->clock,null,'operations',$preflight,$diagnostics);
-        return new OperationsContext($db,$this->clock,$client,$service,$session,$queue,$worker,$config['closure_policy'],$diagnostics,$handoff);
+        $weeklyRanking=($config['weekly_ranking_enabled']??false)===true?new WeeklyRanking($db,$gateway,$this->clock,$config):null;
+        return new OperationsContext($db,$this->clock,$client,$service,$session,$queue,$worker,$config['closure_policy'],$diagnostics,$handoff,$weeklyRanking);
     }
     /** Called solely by EndpointDelivery after a successful ACK finish. */
     public function acknowledgeAndRun(#[\SensitiveParameter] array $config,string $id,AckHandoff $handoff,array $ticket,?SafeDiagnostics $diagnostics=null):array
@@ -71,14 +73,21 @@ final class OperationsRuntime
         }
         $q=$context->db->pdo()->query("SELECT j.interaction_id FROM interaction_jobs j JOIN operations_ack_receipts a ON a.interaction_id=j.interaction_id WHERE j.scope_mode='operations' AND j.state IN ('pending','processing') ORDER BY j.created_at LIMIT 5");
         foreach($q->fetchAll(\PDO::FETCH_COLUMN)as$id){if(!$guard()){break;}if($context->worker->runOnce($id)!==null){$processed++;}}
+        $weekly=[];
+        if($context->weeklyRanking!==null&&$guard()){
+            // Attendance, ACK recovery and closure have priority. Ranking never runs in the ACK callback.
+            try{$result=$context->weeklyRanking->tick($guard);}
+            catch(\Throwable $error){$context->diagnostics?->exception('weekly_ranking',$error);$result=['ok'=>false,'code'=>'weekly_ranking_unavailable'];}
+            $context->diagnostics?->record('weekly_ranking',['ok'=>($result['ok']??false)===true,'code'=>$result['code']??'weekly_ranking_unavailable']);
+            $weekly=['weekly_ranking'=>$result];
+        }
         $context->diagnostics?->record('cycle',['ok'=>true,'code'=>'operations_cycle','count'=>$processed]);
         return ['ok'=>true,'code'=>'operations_cycle','sessions'=>array_column($sessionResults,'code'),'session_results'=>$sessionResults,'jobs_processed'=>$processed,
-            'closure_policy'=>$context->closurePolicy,'atomic_member_updates'=>false,'residual_voice_race'=>$context->closurePolicy==='best_effort'];
+            'closure_policy'=>$context->closurePolicy,'atomic_member_updates'=>false,'residual_voice_race'=>$context->closurePolicy==='best_effort']+$weekly;
     }
     public function pollNeeded(OperationsContext $context):bool
     {
-        $q=$context->db->pdo()->prepare("SELECT 1 FROM sessions WHERE status!='closed' AND opens_at<=? LIMIT 1");$q->execute([$this->clock->now()->getTimestamp()+55]);
-        if($q->fetchColumn()!==false){return true;}
+        if($context->service->scheduledWorkDueBy($this->clock->now()->getTimestamp()+55)){return true;}
         return $context->db->pdo()->query("SELECT 1 FROM interaction_jobs j JOIN operations_ack_receipts a ON a.interaction_id=j.interaction_id WHERE j.scope_mode='operations' AND j.state IN ('pending','processing') LIMIT 1")->fetchColumn()!==false;
     }
 }

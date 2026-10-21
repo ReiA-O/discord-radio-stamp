@@ -8,7 +8,7 @@ use RadioStamp\Http\PrivateConfig;
 /** Separate private small-group scope. Existing owner-only config cannot opt into this by accident. */
 final class OperationsConfig
 {
-    /** Fictional permissionless role IDs for this sanitized offline snapshot. */
+    /** The ten permissionless title roles read back from the approved guild on 2026-10-19. */
     public const TITLE_ROLE_IDS=[
         1=>'800000000000001010',40=>'800000000000001011',80=>'800000000000001012',120=>'800000000000001013',
         160=>'800000000000001014',200=>'800000000000001015',240=>'800000000000001016',280=>'800000000000001017',
@@ -16,6 +16,7 @@ final class OperationsConfig
     ];
     public static function ready(array $config):bool
     {
+        if(array_key_exists('weekly_ranking_enabled',$config)&&!is_bool($config['weekly_ranking_enabled'])){return false;}
         if(isset($config['owner_user_id'])&&!PrivateConfig::snowflake($config['owner_user_id'])){return false;}
         try { \RadioStamp\Core\Schedule::fromConfig($config); } catch (\Throwable) { return false; }
         // Retired trial configuration must not silently run through a new schedule.

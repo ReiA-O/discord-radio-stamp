@@ -38,9 +38,11 @@ final class Runtime
                 $identity = $result->ok && ($result->data['id'] ?? null) === PrivateConfig::APPLICATION_ID && ($result->data['bot'] ?? false) === true;
                 return ['ok' => $identity, 'code' => 'validation_bot_identity_unverified'];
             };
-            $check = function () use ($client, $publisher, &$identity, $op): array {
+            $check = function () use ($client, $publisher, &$identity, $op, $id): array {
                 if ($op['step'] === 'cleanup') { return ['ok' => $publisher->cleanup($identity), 'code' => $this->store->state()['cleanup'] === 'deleted' || !$this->store->state()['post_attempted'] ? 'trial_cleanup_ready' : 'cleanup_unconfirmed']; }
-                $checked = (new BotValidationCheck($client))->run();
+                $profile = PermissionProfile::forOperation($this->store, $id, $this->clock);
+                if ($profile === null) { return ['ok' => false, 'code' => 'trial_permission_scope_unavailable']; }
+                $checked = (new BotValidationCheck($client, $profile))->run();
                 if (!$checked['ok']) { return $checked; }
                 try { new CardRenderer($this->config['font_candidates']); }
                 catch (\Throwable) { return ['ok' => false, 'code' => 'card_preflight_failed']; }

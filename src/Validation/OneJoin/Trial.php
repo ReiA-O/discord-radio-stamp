@@ -9,9 +9,9 @@ use RadioStamp\Http\PrivateConfig;
 /** One disposable owner trial. No runtime input chooses scope or storage. */
 final class Trial
 {
-    public const NAME = 'attendance-one-join-20261019-v3';
+    public const NAME = 'attendance-one-join-20261021-v4';
     public const COMMAND_ID = '800000000000001009';
-    public const NONCE = 'radio-onejoin-20261019-v3';
+    public const NONCE = 'radio-onejoin-20261021-v4';
     public const MAX_SECONDS = Window::OVERALL_SECONDS;
     public const CONTENT = '【本人限定・別DBテスト】本番の出席・ロールには反映しません。\n入室済みの本人だけで確認します。接続したままお待ちください。こちらで「参加」→ 結果後に再度「参加」→「カード表示」を各1回確認します。終了後この投稿を削除します。';
 
@@ -48,7 +48,7 @@ final class Trial
         $allowed = ['trial_controls_ready', 'trial_cleanup_ready', 'not_in_voice', 'voice_unknown', 'voice_stale',
             'attended', 'already_attended', 'card_ready', 'session_closed', 'session_not_started', 'validation_bot_identity_unverified',
             'validation_followup_retry', 'worker_retry', 'controls_post_failed', 'cleanup_unconfirmed', 'unexpected_result',
-            'response_finish_failed', 'runtime_failed', 'expired', 'identity_failed', 'followup_failed', 'card_preflight_failed'];
+            'response_finish_failed', 'runtime_failed', 'expired', 'identity_failed', 'followup_failed', 'card_preflight_failed', 'trial_permission_scope_unavailable'];
         if (is_string($code) && (in_array($code, $allowed, true) || preg_match('/\Abot_check_(self_bot|self_application|guild|bot_member|guild_roles|channel|identity|permissions_unknown|permissions)_failed\z/D', $code) === 1)) { return $code; }
         return 'unexpected_result';
     }

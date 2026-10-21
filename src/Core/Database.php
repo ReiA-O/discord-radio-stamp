@@ -76,6 +76,19 @@ CREATE TABLE IF NOT EXISTS core_effects (
  last_attempt_at INTEGER, completed_at INTEGER, lease_until INTEGER NOT NULL DEFAULT 0, lease_owner TEXT,
  expires_at INTEGER, cancelled_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS weekly_ranking_weeks (
+ week_key TEXT PRIMARY KEY, guild_id TEXT NOT NULL, week_start INTEGER NOT NULL, week_end INTEGER NOT NULL,
+ eligible_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, channel_id TEXT NOT NULL,
+ snapshot_json TEXT NOT NULL, part_count INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('pending','sent','hold','failed','skipped','expired')),
+ created_at INTEGER NOT NULL, UNIQUE(guild_id,week_start)
+);
+CREATE TABLE IF NOT EXISTS weekly_ranking_parts (
+ part_key TEXT PRIMARY KEY, week_key TEXT NOT NULL REFERENCES weekly_ranking_weeks(week_key), part_no INTEGER NOT NULL,
+ payload_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','hold','failed','expired')),
+ attempts INTEGER NOT NULL DEFAULT 0, available_at INTEGER NOT NULL DEFAULT 0, claim_owner TEXT,
+ attempted_at INTEGER, sent_at INTEGER, message_id TEXT, outcome TEXT, UNIQUE(week_key,part_no)
+);
 SQL);
         $columns = $this->connection->query('PRAGMA table_info(core_effects)')->fetchAll(PDO::FETCH_COLUMN, 1);
         foreach (['lease_until' => 'INTEGER NOT NULL DEFAULT 0', 'lease_owner' => 'TEXT', 'expires_at' => 'INTEGER', 'cancelled_at' => 'INTEGER'] as $column => $type) {

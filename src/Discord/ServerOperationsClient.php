@@ -21,9 +21,9 @@ final class ServerOperationsClient
 
     public function __construct(private Database $db,private HttpAdapter $http,#[\SensitiveParameter] private string $botToken,array $options=[])
     {
-        $this->options=$options+['enabled'=>false,'posts_enabled'=>false,'roles_enabled'=>false,'room_permissions_enabled'=>false,'commands_enabled'=>false,'member_actions_enabled'=>false,'accept_voice_race_risk'=>false,'role_ids'=>[],'room_baseline'=>null];
+        $this->options=$options+['enabled'=>false,'posts_enabled'=>false,'roles_enabled'=>false,'room_permissions_enabled'=>false,'commands_enabled'=>false,'member_actions_enabled'=>false,'accept_voice_race_risk'=>false,'weekly_ranking_enabled'=>false,'role_ids'=>[],'room_baseline'=>null];
         $this->diagnostics=($options['diagnostics']??null) instanceof SafeDiagnostics?$options['diagnostics']:null;
-        foreach(['enabled','posts_enabled','roles_enabled','room_permissions_enabled','commands_enabled','member_actions_enabled','accept_voice_race_risk']as$key){if(!is_bool($this->options[$key])){throw new \InvalidArgumentException('operations_flags_invalid');}}
+        foreach(['enabled','posts_enabled','roles_enabled','room_permissions_enabled','commands_enabled','member_actions_enabled','accept_voice_race_risk','weekly_ranking_enabled']as$key){if(!is_bool($this->options[$key])){throw new \InvalidArgumentException('operations_flags_invalid');}}
         if(preg_match('/\A[A-Za-z0-9._-]{20,256}\z/D',$botToken)!==1){throw new \InvalidArgumentException('operations_configuration_invalid');}
         if(!is_array($this->options['role_ids'])||count($this->options['role_ids'])>10){throw new \InvalidArgumentException('operations_roles_invalid');}
         foreach($this->options['role_ids']as$threshold=>$role){if(!isset(TitlePolicy::TITLES[$threshold])||!self::id($role)){throw new \InvalidArgumentException('operations_roles_invalid');}}
@@ -165,6 +165,89 @@ final class ServerOperationsClient
         catch(\Throwable $error){return $this->claimUnavailable($error);}
         return $this->post(DiscordRestClient::RECORDS_CHANNEL_ID,$payload,'day-achievement:'.$user.':'.$milestone,'day_achievement');
     }
+    /** Only the immutable, currently claimed weekly part may use the existing message outbox. */
+    public function postWeeklyRanking(array $payload,string $key):RestResult
+    {
+        if(!$this->options['enabled']||!$this->options['posts_enabled']||!$this->options['weekly_ranking_enabled']){
+            return new RestResult(false,'weekly_ranking_disabled',outcome:TransportOutcome::NotStarted);
+        }
+        if(!\RadioStamp\Core\WeeklyRanking::validPayload($payload)
+            ||preg_match('/\Aweekly-ranking:'.DiscordRestClient::GUILD_ID.':([1-9][0-9]{8,10}):part:([1-9][0-9]*)\z/D',$key,$match)!==1){
+            return new RestResult(false,'scope_rejected',outcome:TransportOutcome::NotStarted);
+        }
+        $encoded=json_encode($payload,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR);
+        $current=function()use($key,$encoded,$match):?array{
+            $q=$this->db->pdo()->prepare("SELECT p.claim_owner,p.payload_json,p.status,p.part_no,w.week_key,w.guild_id,w.channel_id,w.week_start,w.week_end,w.eligible_at,w.expires_at,w.status AS week_status FROM weekly_ranking_parts p JOIN weekly_ranking_weeks w ON w.week_key=p.week_key WHERE p.part_key=?");
+            $q->execute([$key]);$part=$q->fetch();$q->closeCursor();
+            $now=isset($this->options['weekly_ranking_now'])?($this->options['weekly_ranking_now'])():(int)($this->now)();
+            if($part===false||!is_int($now)||$part['status']!=='sending'||$part['week_status']!=='pending'
+                ||$part['guild_id']!==DiscordRestClient::GUILD_ID||$part['channel_id']!==DiscordRestClient::RECORDS_CHANNEL_ID
+                ||$part['week_key']!=='weekly-ranking:'.DiscordRestClient::GUILD_ID.':'.$match[1]
+                ||(int)$part['week_start']!==(int)$match[1]||(int)$part['part_no']!==(int)$match[2]
+                ||(int)$part['week_end']!==(int)$part['week_start']+604800
+                ||(int)$part['eligible_at']!==(int)$part['week_end']+25200
+                ||(int)$part['expires_at']!==(int)$part['week_end']+604800
+                ||$now<(int)$part['eligible_at']||$now>=(int)$part['expires_at']
+                ||!is_string($part['claim_owner'])||preg_match('/\A[0-9a-f]{32}\z/D',$part['claim_owner'])!==1
+                ||!hash_equals($part['payload_json'],$encoded)){return null;}
+            return $part;
+        };
+        try{
+            $part=$current();if($part===null){return new RestResult(false,'scope_rejected',outcome:TransportOutcome::NotStarted);}
+            $lastGuard=static function()use($current,$part):bool{$fresh=$current();return $fresh!==null&&hash_equals($part['claim_owner'],$fresh['claim_owner']);};
+            $result=$this->post(DiscordRestClient::RECORDS_CHANNEL_ID,$payload,$key,'weekly_ranking',$lastGuard);
+            if(!$result->ok){return $result;}
+            $id=$result->data['message_id']??null;
+            if(!self::id($id)){return new RestResult(false,'delivery_uncertain',outcome:TransportOutcome::Uncertain);}
+            return new RestResult(true,$result->code,$result->status,['id'=>$id,'channel_id'=>DiscordRestClient::RECORDS_CHANNEL_ID],$result->retryAfter,$result->syntheticStatus,TransportOutcome::Succeeded);
+        }catch(\Throwable $error){$this->diagnostics?->exception('rest_exception',$error);return new RestResult(false,'delivery_uncertain',outcome:TransportOutcome::Uncertain);}
+    }
+    /** Read the current Connect state without reopening it or changing any overwrite. */
+    public function verifyRoomConnectOpen():RestResult
+    {
+        if(!$this->options['enabled']||!$this->options['posts_enabled']||!$this->options['room_permissions_enabled']){return new RestResult(false,'guard_disabled',outcome:TransportOutcome::NotStarted);}
+        $baseline=$this->options['room_baseline'];
+        if(!is_array($baseline)||!self::bits($baseline['allow']??null)||!self::bits($baseline['deny']??null)){return new RestResult(false,'room_baseline_unavailable',outcome:TransportOutcome::NotStarted);}
+        $response=$this->request('GET','/channels/'.DiscordRestClient::VOICE_CHANNEL_ID,'room:read');
+        if(!$response->ok||($response->data['id']??null)!==DiscordRestClient::VOICE_CHANNEL_ID||!is_array($response->data['permission_overwrites']??null)){return new RestResult(false,'room_unknown',outcome:TransportOutcome::NotStarted);}
+        $matches=array_values(array_filter($response->data['permission_overwrites'],static fn($row):bool=>is_array($row)&&($row['id']??null)===DiscordRestClient::GUILD_ID));
+        if(count($matches)!==1){return new RestResult(false,'room_unknown',outcome:TransportOutcome::NotStarted);}
+        $row=$matches[0];$bit=1<<20;
+        $ok=($row['type']??null)===0&&self::bits($row['allow']??null)&&self::bits($row['deny']??null)
+            &&((int)$row['allow']&$bit)===$bit&&((int)$row['deny']&$bit)===0
+            &&((int)$row['allow']&~$bit)===((int)$baseline['allow']&~$bit)&&((int)$row['deny']&~$bit)===((int)$baseline['deny']&~$bit);
+        return new RestResult($ok,$ok?'room_verified':'room_unknown',outcome:TransportOutcome::NotStarted);
+    }
+
+    /** Only a claimed fixed ten-minute snapshot can opt into the slot-specific @here parse. */
+    public function postOpeningNotice(array $snapshot,string $key,?\Closure $clock=null):RestResult
+    {
+        if(!$this->options['enabled']||!$this->options['posts_enabled']){return new RestResult(false,'operations_posts_disabled',outcome:TransportOutcome::NotStarted);}
+        try{
+            $id=$snapshot['session_id']??null;
+            if(!is_string($id)||$key!==OpeningNoticeMessage::key($id)){return new RestResult(false,'scope_rejected',outcome:TransportOutcome::NotStarted);}
+            $clock??=fn():int=>(int)($this->now)();$claimOwner=null;
+            $scopeGuard=function()use($snapshot,$key,$id,$clock,&$claimOwner):bool{
+                $q=$this->db->pdo()->prepare('SELECT * FROM sessions WHERE id=?');$q->execute([$id]);$session=$q->fetch();$q->closeCursor();
+                if($session===false||in_array($session['status'],['planned','closing','closed'],true)
+                    ||OpeningNoticeMessage::snapshot($session)!==$snapshot){return false;}
+                $now=$clock();
+                if(!is_int($now)||$now<(int)$session['scheduled_at']-600||$now>=(int)$session['scheduled_at']){return false;}
+                $q=$this->db->pdo()->prepare('SELECT * FROM core_effects WHERE effect_key=?');$q->execute([$key]);$effect=$q->fetch();$q->closeCursor();
+                if($effect===false||$effect['kind']!=='opening_notice'||$effect['status']!=='pending'||$effect['cancelled_at']!==null
+                    ||!is_string($effect['lease_owner'])||preg_match('/\A[a-f0-9]{32}\z/D',$effect['lease_owner'])!==1
+                    ||(int)$effect['attempts']<1||(int)$effect['attempts']>5||(int)$effect['expires_at']!==(int)$session['scheduled_at']
+                    ||json_decode($effect['payload_json'],true,32,JSON_THROW_ON_ERROR)!==$snapshot){return false;}
+                if($claimOwner===null){$claimOwner=$effect['lease_owner'];}elseif($effect['lease_owner']!==$claimOwner){return false;}
+                $q=$this->db->pdo()->prepare("SELECT 1 FROM core_effects WHERE effect_key=? AND kind='room_open' AND status='done' AND cancelled_at IS NULL");$q->execute(['open-room:'.$id]);$opened=$q->fetchColumn()!==false;$q->closeCursor();return $opened;
+            };
+            // The GET is outside any core transaction; recheck time/claim again after its latency.
+            $lastGuard=fn():bool=>$scopeGuard()&&$this->verifyRoomConnectOpen()->ok&&$scopeGuard();
+            if(!$lastGuard()){return new RestResult(false,'scope_rejected',outcome:TransportOutcome::NotStarted);}
+            return $this->post(DiscordRestClient::TEXT_CHANNEL_ID,$snapshot['payload'],$key,'opening_notice',$lastGuard);
+        }catch(\Throwable $error){$this->diagnostics?->exception('rest_exception',$error);return new RestResult(false,'delivery_uncertain',outcome:TransportOutcome::Uncertain);}
+    }
+
     private function post(string $channel,array $payload,string $key,string $kind,?\Closure $beforeTransport=null):RestResult
     {
         if(!$this->options['enabled']||!$this->options['posts_enabled']){return new RestResult(false,'operations_posts_disabled',outcome:TransportOutcome::NotStarted);}

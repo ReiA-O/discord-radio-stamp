@@ -3,11 +3,12 @@ declare(strict_types=1);
 namespace RadioStamp\Http;
 
 use RadioStamp\Discord\DiscordRestClient;
+use RadioStamp\Validation\OneJoin\PermissionProfile;
 
 /** Reads only the fixed app, guild, Bot member, roles, and approved channels. */
 final class BotValidationCheck
 {
-    public function __construct(private readonly DiscordRestClient $client) {}
+    public function __construct(private readonly DiscordRestClient $client, private readonly ?PermissionProfile $permissionProfile = null) {}
 
     public function run(): array
     {
@@ -15,9 +16,11 @@ final class BotValidationCheck
             'guide_permissions' => false, 'records_permissions' => false, 'voice_permissions' => false,
             'restricted_permissions' => false];
         $data = [];
+        if ($this->permissionProfile !== null && !$this->permissionProfile->current()) { return ['ok' => false, 'code' => 'bot_check_permissions_failed', 'checks' => $checks]; }
         foreach (['self_bot', 'self_application', 'guild', 'bot_member', 'guild_roles'] as $operation) {
             $response = $this->client->botRead($operation);
             if (!$response->ok) { return ['ok' => false, 'code' => 'bot_check_' . $operation . '_failed', 'checks' => $checks]; }
+            if ($this->permissionProfile !== null && !$this->permissionProfile->current()) { return ['ok' => false, 'code' => 'bot_check_permissions_failed', 'checks' => $checks]; }
             $data[$operation] = $response->data;
         }
         $bot = $data['self_bot']['id'] ?? null;
@@ -31,7 +34,8 @@ final class BotValidationCheck
         if ($base === null) { return ['ok' => false, 'code' => 'bot_check_permissions_unknown', 'checks' => $checks]; }
         // This validation does not need moderation, channel/role management, or moves.
         $forbidden = 2 | 4 | 8 | 16 | 131072 | 16777216 | 268435456 | 1099511627776;
-        $checks['restricted_permissions'] = ($base & $forbidden) === 0 && ($data['guild']['owner_id'] ?? null) !== $bot;
+        $checks['restricted_permissions'] = ($data['guild']['owner_id'] ?? null) !== $bot &&
+            ($this->permissionProfile === null ? ($base & $forbidden) === 0 : $this->permissionProfile->baseAllowed($data['guild_roles'], $data['bot_member']['roles'] ?? [], $base));
         foreach ([
             [PrivateConfig::GUIDE_ID, 'guide_permissions', 0, 1024 | 2048 | 32768],
             [PrivateConfig::RECORDS_ID, 'records_permissions', 0, 1024 | 2048 | 32768],
@@ -39,12 +43,15 @@ final class BotValidationCheck
         ] as [$id, $key, $type, $required]) {
             $response = $this->client->botRead('channel', $id);
             if (!$response->ok) { return ['ok' => false, 'code' => 'bot_check_channel_failed', 'checks' => $checks]; }
+            if ($this->permissionProfile !== null && !$this->permissionProfile->current()) { return ['ok' => false, 'code' => 'bot_check_permissions_failed', 'checks' => $checks]; }
             $channel = $response->data;
             $permissions = $this->effectivePermissions($base, $data['bot_member']['roles'] ?? [], $bot, $channel['permission_overwrites'] ?? []);
             $checks[$key] = ($channel['id'] ?? null) === $id && ($channel['guild_id'] ?? null) === PrivateConfig::GUILD_ID && ($channel['type'] ?? null) === $type &&
                 $permissions !== null && ($permissions & $required) === $required;
-            $checks['restricted_permissions'] = $checks['restricted_permissions'] && $permissions !== null && ($permissions & $forbidden) === 0;
+            $checks['restricted_permissions'] = $checks['restricted_permissions'] && $permissions !== null &&
+                ($this->permissionProfile === null ? ($permissions & $forbidden) === 0 : $this->permissionProfile->channelAllowed($channel, $permissions));
         }
+        if ($this->permissionProfile !== null && !$this->permissionProfile->current()) { $checks['restricted_permissions'] = false; }
         $ok = !in_array(false, $checks, true);
         return ['ok' => $ok, 'code' => $ok ? 'bot_check_passed' : 'bot_check_permissions_failed', 'checks' => $checks];
     }

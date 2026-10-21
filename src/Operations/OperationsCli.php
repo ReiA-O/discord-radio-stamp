@@ -23,7 +23,10 @@ final class OperationsCli
         $context=null;
         try{
             $public=$options['public-root'];
+            $launch=LaunchGate::read($options['config'],$public);
+            if($launch!==null&&!$launch->permits($this->runtime->clock())){return $this->result($emit,false,'operations_not_started',1);}
             $config=OperationsConfig::load($options['config'],$public,!in_array($action,['backup','restore','dry-run'],true));
+            if($launch!==null&&!$launch->matches($config)){throw new \RuntimeException('launch_gate_mismatch');}
             if($action==='dry-run'){return $this->result($emit,OperationsConfig::ready($config),OperationsConfig::ready($config)?'configuration_ready':'configuration_disabled_or_incomplete',OperationsConfig::ready($config)?0:1);}
             if($action==='backup'||$action==='restore'){
                 if($action==='backup'&&!is_file($config['private_db_path'])){return $this->result($emit,false,'active_database_missing',1);}

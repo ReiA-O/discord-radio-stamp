@@ -6,7 +6,7 @@ use RadioStamp\Core\Clock;
 use RadioStamp\Core\SystemClock;
 
 /** In-memory simulation only. There is deliberately no HTTP client or live adapter. */
-final class MockGateway implements AtomicMemberGateway, AchievementGateway, DayAchievementGateway
+final class MockGateway implements AtomicMemberGateway, AchievementGateway, DayAchievementGateway, WeeklyRankingGateway
 {
     /** @var array<string,VoiceState> Keyed by user ID. */
     public array $voiceStates = [];
@@ -16,6 +16,7 @@ final class MockGateway implements AtomicMemberGateway, AchievementGateway, DayA
     public array $results = [];
     /** Explicit local transport facts for day-notice fault injection; bool failures remain uncertain. */
     public array $dayAchievementOutcomes = [];
+    public array $weeklyRankingOutcomes = [];
     public array $actionLog = [];
     public array $roomStates = [];
     public array $decorationRoles = [];
@@ -115,6 +116,17 @@ final class MockGateway implements AtomicMemberGateway, AchievementGateway, DayA
         $ok=$this->action('sendDayAchievement',$key,['channel_id'=>$channelId,'user_id'=>$userId,'milestone'=>$milestone,'total_days'=>$totalDays]+$payload);
         $outcome=$outcome instanceof TransportOutcome?$outcome:($ok?TransportOutcome::Succeeded:TransportOutcome::Uncertain);
         return new RestResult($ok,$ok?'message_confirmed':'delivery_'.$outcome->value,outcome:$outcome);
+    }
+
+    public function sendWeeklyRankingResult(string $channel,array $payload,string $key):RestResult
+    {
+        if(!\RadioStamp\Core\WeeklyRanking::validPayload($payload)){return new RestResult(false,'scope_rejected',outcome:TransportOutcome::NotStarted);}
+        $outcome=array_shift($this->weeklyRankingOutcomes);
+        if($outcome instanceof TransportOutcome){$this->results[$key]=$outcome===TransportOutcome::Succeeded;}
+        $ok=$this->action('sendWeeklyRanking',$key,['channel_id'=>$channel]+$payload);
+        $outcome=$outcome instanceof TransportOutcome?$outcome:($ok?TransportOutcome::Succeeded:TransportOutcome::Uncertain);
+        return new RestResult($ok,$ok?'message_confirmed':'delivery_'.$outcome->value,
+            data:$ok?['id'=>'900000000000009800','channel_id'=>$channel]:[],outcome:$outcome);
     }
 
     public function setRoomOpen(string $channelId, bool $open, string $key): bool

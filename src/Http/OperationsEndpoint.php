@@ -4,7 +4,7 @@ namespace RadioStamp\Http;
 
 use RadioStamp\Core\Database;
 use RadioStamp\Security\TokenCipher;
-use RadioStamp\Operations\{OperationsConfig,OperationsRuntime,SafeDiagnostics,AckHandoff};
+use RadioStamp\Operations\{OperationsConfig,OperationsRuntime,SafeDiagnostics,AckHandoff,LaunchGate};
 
 /** Separate, explicitly enabled small-group endpoint. No registration or periodic tick on HTTP. */
 final class OperationsEndpoint
@@ -16,7 +16,10 @@ final class OperationsEndpoint
         $started=hrtime(true);$mask=umask(0077);$diagnostics=null;
         try{
             if($configPath===null){throw new \RuntimeException('operations_unavailable');}
+            $launch=LaunchGate::read($configPath,$this->publicRoot);
+            if($launch!==null&&!$launch->permits($this->runtime->clock())){return new EndpointDelivery(new Response(503,['error'=>'operations_not_started']),null);}
             $config=OperationsConfig::load($configPath,$this->publicRoot);
+            if($launch!==null&&!$launch->matches($config)){throw new \RuntimeException('launch_gate_mismatch');}
             $diagnostics=SafeDiagnostics::fromConfig($config,null,$started);
             $diagnostics->record('http_prepare',['ok'=>true,'code'=>'config_ready']);
             $preparedQueue=null;

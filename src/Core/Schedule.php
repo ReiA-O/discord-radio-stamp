@@ -16,12 +16,18 @@ final class Schedule
     private array $daily=[];
     private array $oneOff=[];
     private array $replacements=[];
+    private ?int $firstSessionAt=null;
     private DateTimeZone $timezone;
 
     public function __construct(array $spec = self::DEFAULT_SPEC)
     {
         $this->timezone=new DateTimeZone('Asia/Tokyo');
-        if(array_diff(array_keys($spec),['daily_times','one_off_times'])!==[]){throw new \InvalidArgumentException('schedule_invalid');}
+        if(array_diff(array_keys($spec),['daily_times','one_off_times','not_before'])!==[]){throw new \InvalidArgumentException('schedule_invalid');}
+        if(array_key_exists('not_before',$spec)){
+            $value=$spec['not_before'];$at=is_string($value)?DateTimeImmutable::createFromFormat('!Y-m-d H:i',$value,$this->timezone):false;
+            if(!is_string($value)||strlen($value)!==16||$at===false||$at->format('Y-m-d H:i')!==$value||!self::validSessionId($at->format('Y-m-d_Hi'))){throw new \InvalidArgumentException('schedule_invalid');}
+            $this->firstSessionAt=$at->getTimestamp();
+        }
         $daily=$spec['daily_times']??[];$dates=$spec['one_off_times']??[];
         if(!is_array($daily)||!array_is_list($daily)||!is_array($dates)||!array_is_list($dates)||($daily===[]&&$dates===[])){throw new \InvalidArgumentException('schedule_invalid');}
         $dailySlots=[];
@@ -72,6 +78,7 @@ final class Schedule
             }
             $found[$id]=$occurrence;
         }
+        if($this->firstSessionAt!==null){$found=array_filter($found,fn(array $row):bool=>$row['at']->getTimestamp()>=$this->firstSessionAt);}
         ksort($found);return $found;
     }
     private function validateSpacing(): void
@@ -100,6 +107,12 @@ final class Schedule
     public static function validSessionId(string $id): bool
     {
         return preg_match('/\A(20[0-9]{2})-(0[1-9]|1[0-2])-([0-3][0-9])_([01][0-9]|2[0-3])([0-5][0-9])\z/D',$id,$m)===1&&checkdate((int)$m[2],(int)$m[3],(int)$m[1]);
+    }
+    public function firstSessionAt():?int{return $this->firstSessionAt;}
+    public function isBeforeStart(string $id):bool
+    {
+        if($this->firstSessionAt===null||!self::validSessionId($id)){return false;}
+        return DateTimeImmutable::createFromFormat('!Y-m-d_Hi',$id,$this->timezone)->getTimestamp()<$this->firstSessionAt;
     }
     public function contains(string $id): bool
     {

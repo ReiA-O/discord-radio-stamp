@@ -5,7 +5,7 @@ namespace RadioStamp\Discord;
 use RadioStamp\Core\Clock;
 use RadioStamp\Operations\SafeDiagnostics;
 /** Small-group operational adapter; best-effort capability is deliberately separate from AtomicMemberGateway. */
-final class ServerOperationsGateway implements DeliveryAwareGateway,RoleGateway,BestEffortMemberGateway,DayAchievementGateway
+final class ServerOperationsGateway implements DeliveryAwareGateway,RoleGateway,BestEffortMemberGateway,DayAchievementGateway,WeeklyRankingGateway,OpeningNoticeGateway
 {
     public function __construct(private ServerOperationsClient $client,private Clock $clock,private array $config,private ?VoiceRosterSource $source=null,private ?SafeDiagnostics $diagnostics=null)
     {
@@ -38,6 +38,11 @@ final class ServerOperationsGateway implements DeliveryAwareGateway,RoleGateway,
         return $roster;
     }
     public function sendMessage(string $channel,string $content,string $key,array $components=[]):bool{return $components===[]&&$this->client->postText($channel,$content,$key)->ok;}
+    public function openingRoomVerified():bool{return $this->client->verifyRoomConnectOpen()->ok;}
+    public function sendOpeningNoticeResult(array $snapshot,string $key):RestResult
+    {
+        return $this->client->postOpeningNotice($snapshot,$key,fn():int=>$this->clock->now()->getTimestamp());
+    }
     public function sendReceipt(string $sessionId,int $closesAt,string $key):bool{return $this->sendReceiptResult($sessionId,$closesAt,$key)->ok;}
     public function sendReceiptResult(string $sessionId,int $closesAt,string $key):RestResult
     {
@@ -68,6 +73,13 @@ final class ServerOperationsGateway implements DeliveryAwareGateway,RoleGateway,
             return new RestResult(false,'scope_rejected',outcome:TransportOutcome::NotStarted);
         }
         return $this->client->postDayAchievement($user,$milestone,$totalDays,$ownerUserId,$key);
+    }
+    public function sendWeeklyRankingResult(string $channel,array $payload,string $key):RestResult
+    {
+        if($channel!==DiscordRestClient::RECORDS_CHANNEL_ID||($this->config['weekly_ranking_enabled']??false)!==true){
+            return new RestResult(false,'weekly_ranking_disabled',outcome:TransportOutcome::NotStarted);
+        }
+        return $this->client->postWeeklyRanking($payload,$key);
     }
     public function supportsBestEffortMemberActions():bool{return $this->config['closure_policy']==='best_effort'&&$this->config['accept_voice_race_risk']&&$this->config['member_actions_enabled'];}
     public function moveMemberGuarded(string $guild,string $user,string $destination,MemberActionFence $fence,string $key):bool

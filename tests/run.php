@@ -2,7 +2,6 @@
 declare(strict_types=1);
 require_once __DIR__.'/artifact_directory.php';
 
-
 $files = ['core.php', 'concurrency.php', 'http.php', 'cards.php', 'voice_safety.php', 'core_admin_validation.php', 'runtime_check.php', 'rest.php', 'command_response_inspector.php', 'admin_http.php', 'connection_receipt.php', 'config_diagnostics.php', 'config_entry_diagnostics.php', 'one_join.php', 'presence_diagnostics.php', 'one_join_window.php', 'participation_policy.php', 'status.php', 'achievements.php', 'post_exercise.php', 'operations_adapter.php', 'operations_recovery.php', 'gateway_connection.php', 'operations_runtime.php'];
 $failures = 0;
 $files[] = 'production_parity.php';
@@ -17,6 +16,10 @@ $files[] = 'five_slot_policy.php';
 $files[] = 'award_notifications.php';
 $files[] = 'memorial_artwork.php';
 $files[] = 'card_download.php';
+$files[] = 'one_join_scoped_permissions.php';
+$files[] = 'weekly_ranking.php';
+$files[] = 'opening_notice.php';
+$files[] = 'prelaunch_gate.php';
 foreach ($files as $name) {
     $path = __DIR__ . '/' . $name;
     if (!is_file($path)) { fwrite(STDERR, "MISSING: $name\n"); $failures++; continue; }

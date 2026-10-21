@@ -80,12 +80,15 @@ try {
             $same(0,count($messages($f,DiscordRestClient::TEXT_CHANNEL_ID)),'no notice before S-30');
             $f['clock']->advance(1);$f['runtime']->cycle($f['context'],static fn()=>true);
             $same('open',$row($f)['status'],'S-30 opens same scheduler');
-            $same(1,count($messages($f,DiscordRestClient::TEXT_CHANNEL_ID)),'one pre-notice');
+            $same(0,count($messages($f,DiscordRestClient::TEXT_CHANNEL_ID)),'opening does not send the retired thirty-minute notice');
             $same(1,count($messages($f,$vc)),'one opening guide');
             $same(1<<20,(int)$f['http']->allow&(1<<20),'CONNECT opened');
             $same(0,(int)$f['http']->deny&(1<<20),'CONNECT no longer denied');
-            $f['runtime']->cycle($f['context'],static fn()=>true);$same(1,count($messages($f,DiscordRestClient::TEXT_CHANNEL_ID)),'pre-notice duplicate prevented');
-            $f['clock']->advance(30*60+8*60);$origin=$f['clock']->now()->getTimestamp();
+            $f['runtime']->cycle($f['context'],static fn()=>true);$same(0,count($messages($f,DiscordRestClient::TEXT_CHANNEL_ID)),'no immediate notice on another opening cycle');
+            $f['clock']->advance(20*60-1);$f['runtime']->cycle($f['context'],static fn()=>true);$same(0,count($messages($f,DiscordRestClient::TEXT_CHANNEL_ID)),'not before the ten-minute boundary');
+            $f['clock']->advance(1);$f['runtime']->cycle($f['context'],static fn()=>true);$same(1,count($messages($f,DiscordRestClient::TEXT_CHANNEL_ID)),'one ten-minute notice after verified opening');
+            $f['runtime']->cycle($f['context'],static fn()=>true);$same(1,count($messages($f,DiscordRestClient::TEXT_CHANNEL_ID)),'ten-minute notice duplicate prevented');
+            $f['clock']->advance(18*60);$origin=$f['clock']->now()->getTimestamp();
             [$response,$ok]=$send($f,$first,'radio-attend',[],[],false);
             $same(['type'=>5,'data'=>['flags'=>64]],$response->body,'ordinary non-admin gets private ACK');
             $same(false,$ok,'failed ACK finish stops worker');$same(0,count($receipt($f)),'no receipt side effect after failed ACK');
