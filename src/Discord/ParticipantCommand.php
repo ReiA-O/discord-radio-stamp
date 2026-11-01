@@ -9,6 +9,6 @@ final class ParticipantCommand
 
     public static function definition(): array
     {
-        return ['type'=>1, 'name'=>self::NAME, 'description'=>'体操後の共有参加受付を開始（10分間）', 'nsfw'=>true, 'options'=>[]];
+        return ['type'=>1, 'name'=>self::NAME, 'description'=>'体操後の共有参加受付を開始（10分間）', 'nsfw'=>false, 'options'=>[]];
     }
 }

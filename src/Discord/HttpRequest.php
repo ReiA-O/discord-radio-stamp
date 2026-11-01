@@ -16,6 +16,7 @@ final class HttpRequest
         public readonly bool $asyncDnsRequired = false,
         private readonly ?RoleMutationScope $roleMutationScope = null,
         private readonly ?RoomMutationScope $roomMutationScope = null,
+        private readonly ?OpeningNoticeScope $openingNoticeScope = null,
     ) {
         $parts = parse_url($address);
         // DELETE is limited to the one fixed VC message path; ordinary REST still
@@ -35,6 +36,7 @@ final class HttpRequest
         foreach ($requestHeaders as $header) {
             if (!is_string($header) || preg_match('/[\r\n\x00]/', $header)) { throw new \InvalidArgumentException('discord_request_invalid'); }
         }
+        OutboundMentionGuard::assertRequest($verb,$parts['path']??'',$requestHeaders,$requestBody,$openingNoticeScope);
     }
     public function method(): string { return $this->verb; }
     public function url(): string { return $this->address; }

@@ -9,6 +9,7 @@ final class DiscordRestClient
     public const GUILD_ID = '800000000000001001';
     public const ADMIN_USER_ID = '800000000000001021';
     public const TEXT_CHANNEL_ID = '800000000000001005';
+    public const OPENING_NOTICE_CHANNEL_ID = '900000000000099012';
     public const RECORDS_CHANNEL_ID = '800000000000001006';
     public const VOICE_CHANNEL_ID = '800000000000001007';
     private const BASE = 'https://discord.com/api/v10';
@@ -56,7 +57,7 @@ final class DiscordRestClient
             'guild' => '/guilds/' . self::GUILD_ID,
             'bot_member' => $this->botId === null ? null : '/guilds/' . self::GUILD_ID . '/members/' . $this->botId,
             'guild_roles' => '/guilds/' . self::GUILD_ID . '/roles',
-            'channel' => in_array($id, [self::TEXT_CHANNEL_ID, self::RECORDS_CHANNEL_ID, self::VOICE_CHANNEL_ID], true) ? '/channels/' . $id : null,
+            'channel' => in_array($id, [self::TEXT_CHANNEL_ID, self::OPENING_NOTICE_CHANNEL_ID, self::RECORDS_CHANNEL_ID, self::VOICE_CHANNEL_ID], true) ? '/channels/' . $id : null,
             'admin_voice' => '/guilds/' . self::GUILD_ID . '/voice-states/' . self::ADMIN_USER_ID,
             default => null,
         };
@@ -128,8 +129,8 @@ final class DiscordRestClient
     {
         return [
             ['type' => 1, 'name' => 'radio-check', 'description' => '本人限定のBot接続と権限を確認', 'default_member_permissions' => '0', 'nsfw' => true, 'options' => []],
-            ['type' => 1, 'name' => 'radio-card', 'description' => '本人の月間スタンプカード', 'default_member_permissions' => '0', 'nsfw' => true, 'options' => [['type' => 3, 'name' => 'month', 'description' => '対象年月（YYYY-MM）', 'required' => false, 'min_length' => 7, 'max_length' => 7]]],
-            ['type' => 1, 'name' => 'radio-status', 'description' => '自分の累計参加回数と参加日数を確認', 'default_member_permissions' => '0', 'nsfw' => true, 'options' => []],
+            ['type' => 1, 'name' => 'radio-card', 'description' => '本人の月間スタンプカード', 'default_member_permissions' => '0', 'nsfw' => false, 'options' => [['type' => 3, 'name' => 'month', 'description' => '対象年月（YYYY-MM）', 'required' => false, 'min_length' => 7, 'max_length' => 7]]],
+            ['type' => 1, 'name' => 'radio-status', 'description' => '自分の累計参加回数と参加日数を確認', 'default_member_permissions' => '0', 'nsfw' => false, 'options' => []],
         ];
     }
 

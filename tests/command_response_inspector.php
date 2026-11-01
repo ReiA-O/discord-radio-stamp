@@ -22,7 +22,7 @@ foreach(['[]','null','"fixture"']as$raw){$r=Inspector::inspect(201,$raw,$card);$
 $value=$actual;unset($value['id']);$r=$inspect($value,$card);$assert(!$r['id_present']&&!$r['id_valid']&&$r['definition_matches'],'missing id distinguished from definition match');
 foreach([123456789012345678,'bad-id',null]as$id){$value=$actual;$value['id']=$id;$r=$inspect($value,$card);$assert($r['id_present']&&!$r['id_valid']&&$r['definition_matches'],'invalid id distinguished');}
 foreach(['application_id'=>'application_matches','guild_id'=>'guild_matches']as$key=>$flag){$value=$actual;$value[$key]='900000000000000099';$r=$inspect($value,$card);$assert($r['id_valid']&&$r['definition_matches']&&!$r[$flag]&&!$r['verified'],'scope mismatch independent');}
-foreach(['name'=>'other','description'=>'other','type'=>2,'nsfw'=>false,'default_member_permissions'=>null]as$key=>$wrong){$value=$actual;$value[$key]=$wrong;$r=$inspect($value,$card);$assert(!$r['verified']&&$r['id_valid']&&$r['fields'][$key]==='different','individual top-level mismatch');}
+foreach(['name'=>'other','description'=>'other','type'=>2,'nsfw'=>!$card['nsfw'],'default_member_permissions'=>null]as$key=>$wrong){$value=$actual;$value[$key]=$wrong;$r=$inspect($value,$card);$assert(!$r['verified']&&$r['id_valid']&&$r['fields'][$key]==='different','individual top-level mismatch');}
 foreach(['type'=>4,'required'=>true,'autocomplete'=>true,'min_length'=>6,'max_length'=>8]as$key=>$wrong){$value=$actual;$value['options'][0][$key]=$wrong;$r=$inspect($value,$card);$assert(!$r['verified']&&$r['fields']['options[0].'.$key]==='different','individual option mismatch');}
 $value=$actual;$value['default_member_permissions']=0;$assert($inspect($value,$card)['fields']['default_member_permissions']==='invalid_type','permission integer zero is not string zero');
 $value=$actual;$value['options'][0]['min_length']='7';$assert($inspect($value,$card)['fields']['options[0].min_length']==='invalid_type','length string is not numeric coercion');
@@ -32,7 +32,7 @@ $value['options'][0]['name_localized']='SENSITIVE_FIXTURE_NEVER_OUTPUT';$value['
 $assert($inspect($value,$card)['verified'],'omitted false and null/response-only localization metadata accepted');
 $value=$object($status);unset($value['type'],$value['options']);$assert($inspect($value,$status)['verified'],'omitted type and empty options use documented/structural defaults');
 $false=$status;$false['nsfw']=false;$value=$object($false);unset($value['nsfw']);$assert($inspect($value,$false)['verified'],'missing nsfw equals false');
-$value=$object($status);unset($value['nsfw']);$assert(!$inspect($value,$status)['verified'],'missing nsfw never equals requested true');
+$requestedTrue=$status;$requestedTrue['nsfw']=true;$value=$object($requestedTrue);unset($value['nsfw']);$assert(!$inspect($value,$requestedTrue)['verified'],'missing nsfw never equals requested true');
 $value=$object($status);$value['options']=null;$assert($inspect($value,$status)['fields']['options']==='invalid_type','null options not treated as empty');
 $value=$actual;$value['options'][0]['required']=null;$assert($inspect($value,$card)['fields']['options[0].required']==='invalid_type','null bool not treated as omitted false');
 $value=$actual;$value['options'][0]['name_localizations']=['ja'=>'different'];$assert($inspect($value,$card)['fields']['options[0].name_localizations']==='different','real translations are preserved as differences');

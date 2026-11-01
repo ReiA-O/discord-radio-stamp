@@ -12,7 +12,10 @@ final class AckHandoff
     private string $key;
     private const MAX_BYTES=4096;
 
-    public function __construct(#[\SensitiveParameter] array $config)
+    /** HTTP ingress validates the pre-provisioned journal without creating it. */
+    public static function openExisting(#[\SensitiveParameter] array $config):self{return new self($config,false);}
+
+    public function __construct(#[\SensitiveParameter] array $config,bool $initialize=true)
     {
         $root=$config['private_root']??null;$db=$config['private_db_path']??null;
         if(!is_string($root)||!is_string($db)||!is_string($config['token_encryption_key_hex']??null)
@@ -28,7 +31,7 @@ final class AckHandoff
         $this->requireMode($root,0700);
         $directory=$root.DIRECTORY_SEPARATOR.'ack-handoff';
         if(is_link($directory)){throw new \RuntimeException('ack_handoff_unavailable');}
-        if(!is_dir($directory)&&!@mkdir($directory,0700)&&!is_dir($directory)){throw new \RuntimeException('ack_handoff_unavailable');}
+        if(!is_dir($directory)&&(!$initialize||!@mkdir($directory,0700))&&!is_dir($directory)){throw new \RuntimeException('ack_handoff_unavailable');}
         $this->directory=$this->canonical($directory,true);$this->requireMode($this->directory,0700);
         $this->binding=hash('sha256','ack-instance-v1'."\0".$this->normalize($db)."\0".($config['application_id']??'')."\0".($config['guild_id']??''));
         $this->key=hash_hmac('sha256','radio-stamp/ack-handoff/v1',hex2bin($config['token_encryption_key_hex']),true);

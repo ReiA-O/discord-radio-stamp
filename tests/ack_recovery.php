@@ -22,9 +22,9 @@ final class AckRecoveryHttp implements HttpAdapter
 final class AckRecoveryDriver implements PostResponseDriver
 {
     public int $finishes=0;
-    public function __construct(private ?PDO $locker=null,private bool $success=true,private bool $throw=false){}
+    public function __construct(private ?PDO $locker=null,private bool $success=true,private bool $throw=false,private ?\Closure $finishHook=null){}
     public function available():bool{return true;}
-    public function finish():bool{$this->finishes++;if($this->throw){throw new RuntimeException('fictional_finish_failure');}if($this->locker!==null){$this->locker->exec('BEGIN IMMEDIATE');}return $this->success;}
+    public function finish():bool{$this->finishes++;if($this->throw){throw new RuntimeException('fictional_finish_failure');}if($this->finishHook!==null){($this->finishHook)();}if($this->locker!==null){$this->locker->exec('BEGIN IMMEDIATE');}return $this->success;}
 }
 
 // Child paths only use fake adapters, or queue/journal storage without any adapter.
@@ -84,13 +84,130 @@ $ticket=static function(array $f,string $id):array{return $f['context']->handoff
 $emit=static fn(Response $response)=>null;
 
 try{
+    // Signed HTTP ingress consumes provisioned storage; it never creates or migrates it before ACK.
+    $root=$temp.'/missing_ingress';mkdir($root,0700);mkdir($root.'/private',0700);mkdir($root.'/public',0700);
+    $config=runtimeFixtureConfig($root,'best_effort',true);$config['participant_scope']='guild';$config['participant_user_ids']=[];
+    $config['live_automation_enabled']=true;$config['diagnostics_enabled']=true;
+    $config['schedule']=['daily_times'=>[],'one_off_times'=>[['at'=>'2026-10-20 14:30','slot_id'=>'morning']]];
+    $path=$root.'/private/config.php';file_put_contents($path,"<?php\nreturn ".var_export($config,true).";\n");
+    $config=OperationsConfig::load($path,$root.'/public');$clock=new FrozenClock('2026-10-20T14:05:00+09:00');
+    $inner=new RuntimeFixtureHttp();$http=new AckRecoveryHttp($inner);$runtime=new OperationsRuntime($http,fn()=>$inner->transport(),$clock);
+    $missing=compact('root','config','path','clock','inner','http','runtime');[$unavailable]=$prepare($missing,new AckRecoveryDriver());
+    $same(503,$unavailable->response->status,'missing DB fails before ACK');$same(false,file_exists($config['private_db_path']),'HTTP ingress does not create a missing DB');
+    $same(0,count($inner->calls),'missing DB failure performs no HTTP');unset($missing);
+
+    $root=$temp.'/empty_ingress';mkdir($root,0700);mkdir($root.'/private',0700);mkdir($root.'/public',0700);
+    $config=runtimeFixtureConfig($root,'best_effort',true);$config['participant_scope']='guild';$config['participant_user_ids']=[];
+    $config['live_automation_enabled']=true;$config['diagnostics_enabled']=true;
+    $config['schedule']=['daily_times'=>[],'one_off_times'=>[['at'=>'2026-10-20 14:30','slot_id'=>'morning']]];
+    touch($config['private_db_path']);chmod($config['private_db_path'],0600);$path=$root.'/private/config.php';file_put_contents($path,"<?php\nreturn ".var_export($config,true).";\n");
+    $config=OperationsConfig::load($path,$root.'/public');$clock=new FrozenClock('2026-10-20T14:05:00+09:00');
+    $inner=new RuntimeFixtureHttp();$http=new AckRecoveryHttp($inner);$runtime=new OperationsRuntime($http,fn()=>$inner->transport(),$clock);
+    $empty=compact('root','config','path','clock','inner','http','runtime');$emptyDriver=new AckRecoveryDriver();[$unavailable]=$prepare($empty,$emptyDriver);
+    $same(503,$unavailable->response->status,'empty existing DB fails before ACK');
+    $same(true,$unavailable->deliver($emptyDriver,$emit),'empty-schema 503 finishes before diagnostics flush');
+    $inspect=new PDO('sqlite:'.$config['private_db_path']);$inspect->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE,PDO::FETCH_ASSOC);
+    $same([],array_column($inspect->query("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'")->fetchAll(),'name'),'HTTP ingress creates no schema');
+    $same(0,(int)$inspect->query('PRAGMA schema_version')->fetchColumn(),'HTTP ingress leaves empty schema version unchanged');
+    $same(0,count($inner->calls),'empty-schema failure performs no HTTP');$safeLog=file_get_contents($root.'/private/operations-diagnostic.safe.jsonl');
+    $assert(str_contains($safeLog,'"code":"private_queue_unavailable"')&&!str_contains($safeLog,$config['private_db_path'])&&!str_contains($safeLog,$config['token_encryption_key_hex']),'schema failure emits only fixed diagnostics');unset($inspect,$empty);
+
+    foreach(['missing_ack_table','legacy_queue','bad_queue_pk']as$case){
+        $broken=$make($case);$pdo=$broken['context']->db->pdo();
+        if($case==='missing_ack_table'){$pdo->exec('DROP TABLE operations_ack_receipts');}
+        else{$pdo->exec('ALTER TABLE interaction_jobs RENAME TO interaction_jobs_current');$scope=$case==='legacy_queue'?'':"scope_mode TEXT NOT NULL DEFAULT 'mock',";$primary=$case==='bad_queue_pk'?'':' PRIMARY KEY';$pdo->exec("CREATE TABLE interaction_jobs(interaction_id TEXT".$primary.",action TEXT NOT NULL,target TEXT NOT NULL,user_id TEXT NOT NULL,display_name TEXT NOT NULL,request_hash TEXT NOT NULL,".$scope."token_ciphertext TEXT NOT NULL,created_at INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,lease_id TEXT,claimed_at INTEGER,available_at INTEGER NOT NULL DEFAULT 0,result_code TEXT)");}
+        $version=(int)$pdo->query('PRAGMA schema_version')->fetchColumn();[$brokenResponse,$brokenId]=$prepare($broken,new AckRecoveryDriver());
+        $same(503,$brokenResponse->response->status,$case.' schema mismatch fails before ACK');
+        $same($version,(int)$pdo->query('PRAGMA schema_version')->fetchColumn(),$case.' is not migrated by HTTP ingress');
+        if($case==='missing_ack_table'){$same(0,(int)$pdo->query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='operations_ack_receipts'")->fetchColumn(),'missing ACK table stays missing');}
+        elseif($case==='legacy_queue'){$same(false,in_array('scope_mode',$pdo->query('PRAGMA table_info(interaction_jobs)')->fetchAll(PDO::FETCH_COLUMN,1),true),'legacy queue column stays missing');}
+        else{$pk=array_values(array_filter($pdo->query('PRAGMA table_info(interaction_jobs)')->fetchAll(PDO::FETCH_ASSOC),static fn(array $column):bool=>$column['name']==='interaction_id'))[0]['pk'];$same(0,(int)$pk,'bad queue primary key stays invalid');}
+        $same(0,(int)$pdo->query("SELECT COUNT(*) FROM interaction_jobs WHERE interaction_id='".$brokenId."'")->fetchColumn(),$case.' leaves no queued job');
+        $same(0,count($broken['inner']->calls),$case.' performs no HTTP');
+    }
+
+    foreach(['discord_rest_limits','discord_rest_routes','discord_rest_commands','operation_receipts','operation_role_sync','gateway_identify_budget','gateway_closure_attempts','operations_queue_instance','achievement_notices']as$table){
+        $broken=$make('missing_'.$table);$pdo=$broken['context']->db->pdo();$pdo->exec('DROP TABLE '.$table);
+        $version=(int)$pdo->query('PRAGMA schema_version')->fetchColumn();[$brokenResponse,$brokenId]=$prepare($broken,new AckRecoveryDriver());
+        $same(503,$brokenResponse->response->status,$table.' missing schema fails before ACK');
+        $same($version,(int)$pdo->query('PRAGMA schema_version')->fetchColumn(),$table.' is not created by HTTP ingress');
+        $same(0,(int)$pdo->query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='".$table."'")->fetchColumn(),$table.' stays missing');
+        $same(0,(int)$pdo->query("SELECT COUNT(*) FROM interaction_jobs WHERE interaction_id='".$brokenId."'")->fetchColumn(),$table.' failure leaves no queued job');
+        $same(0,count($broken['inner']->calls),$table.' failure performs no HTTP');
+    }
+    $broken=$make('legacy_operation_receipts');$pdo=$broken['context']->db->pdo();$pdo->exec('ALTER TABLE operation_receipts RENAME TO operation_receipts_current');
+    $pdo->exec("CREATE TABLE operation_receipts(operation_key TEXT PRIMARY KEY,kind TEXT NOT NULL,target TEXT NOT NULL,payload_sha256 TEXT NOT NULL,status TEXT NOT NULL,message_id TEXT,created_at INTEGER NOT NULL,finished_at INTEGER)");
+    $version=(int)$pdo->query('PRAGMA schema_version')->fetchColumn();[$brokenResponse,$brokenId]=$prepare($broken,new AckRecoveryDriver());
+    $same(503,$brokenResponse->response->status,'missing operation receipt column fails before ACK');
+    $same($version,(int)$pdo->query('PRAGMA schema_version')->fetchColumn(),'missing operation receipt column is not migrated by HTTP ingress');
+    $same(false,in_array('claim_owner',$pdo->query('PRAGMA table_info(operation_receipts)')->fetchAll(PDO::FETCH_COLUMN,1),true),'missing operation receipt column stays missing');
+    $same(0,(int)$pdo->query("SELECT COUNT(*) FROM interaction_jobs WHERE interaction_id='".$brokenId."'")->fetchColumn(),'operation receipt mismatch leaves no queued job');
+    $same(0,count($broken['inner']->calls),'operation receipt mismatch performs no HTTP');
+    $broken=$make('invalid_queue_instance');$pdo=$broken['context']->db->pdo();$pdo->exec("UPDATE operations_queue_instance SET instance_id='invalid' WHERE name='operations'");
+    [$brokenResponse,$brokenId]=$prepare($broken,new AckRecoveryDriver());$same(503,$brokenResponse->response->status,'invalid queue instance fails before ACK');
+    $same('invalid',(string)$pdo->query("SELECT instance_id FROM operations_queue_instance WHERE name='operations'")->fetchColumn(),'HTTP ingress does not reseed invalid queue instance');
+    $same(0,(int)$pdo->query("SELECT COUNT(*) FROM interaction_jobs WHERE interaction_id='".$brokenId."'")->fetchColumn(),'invalid queue instance leaves no queued job');
+    $same(0,count($broken['inner']->calls),'invalid queue instance performs no HTTP');
+
+    $missingJournal=$make('missing_ack_directory');$journal=$missingJournal['root'].'/private/ack-handoff';rmdir($journal);
+    $missingSchemaVersion=(int)$missingJournal['context']->db->pdo()->query('PRAGMA schema_version')->fetchColumn();
+    [$journalUnavailable,$journalJob]=$prepare($missingJournal,new AckRecoveryDriver());
+    $same(503,$journalUnavailable->response->status,'missing ACK journal fails before ACK');
+    $same(false,file_exists($journal),'HTTP ingress does not create missing ACK journal');
+    $same(0,(int)$missingJournal['context']->db->pdo()->query("SELECT COUNT(*) FROM interaction_jobs WHERE interaction_id='".$journalJob."'")->fetchColumn(),'missing ACK journal leaves no queued job');
+    $same($missingSchemaVersion,(int)$missingJournal['context']->db->pdo()->query('PRAGMA schema_version')->fetchColumn(),'missing ACK journal performs no schema write');
+    $same(0,count($missingJournal['inner']->calls),'missing ACK journal performs no HTTP');
+
+    $x=$make('existing_schema_ingress');$schemaVersion=(int)$x['context']->db->pdo()->query('PRAGMA schema_version')->fetchColumn();
+    [$prepared,$preparedId]=$prepare($x,new AckRecoveryDriver());
+    $same(['type'=>5,'data'=>['flags'=>64]],$prepared->response->body,'provisioned schema prepares defer');
+    $same($schemaVersion,(int)$x['context']->db->pdo()->query('PRAGMA schema_version')->fetchColumn(),'HTTP ingress performs no schema write');
+    $same(1,(int)$x['context']->db->pdo()->query("SELECT COUNT(*) FROM interaction_jobs WHERE interaction_id='".$preparedId."'")->fetchColumn(),'provisioned schema accepts one queue insert');
+    $same(0,count($x['inner']->calls),'pre-ACK provisioned ingress performs no HTTP');
+    $scenarios['existing_schema_only_ingress']=['missing_db_status'=>503,'empty_db_status'=>503,'schema_mismatch_status'=>503,'missing_journal_status'=>503,'provisioned_ack_type'=>5,'schema_writes'=>0,'http_calls'=>0];
+
+    // A schema loss after the response is emitted is not repaired inside the HTTP lifecycle.
+    $postAck=$make('post_ack_schema_loss');[$postAckDelivery,$postAckJob]=$prepare($postAck,new AckRecoveryDriver());$ackEmitted=false;
+    $postAckDriver=new AckRecoveryDriver(null,true,false,static function()use($postAck,&$ackEmitted,$same):void{
+        $same(true,$ackEmitted,'schema-loss hook runs only after fake ACK emit');
+        $postAck['context']->db->pdo()->exec('DROP TABLE operations_ack_receipts');
+    });
+    $same(true,$postAckDelivery->deliver($postAckDriver,static function(Response $response)use(&$ackEmitted):void{$ackEmitted=true;}),'ACK remains delivered when post-response schema validation fails');
+    $same(0,(int)$postAck['context']->db->pdo()->query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='operations_ack_receipts'")->fetchColumn(),'post-response HTTP does not recreate missing ACK table');
+    $same(1,count($markers($postAck)),'durable finish proof remains for maintenance recovery');
+    $same('pending',$state($postAck,$postAckJob)['state'],'post-response schema failure leaves job pending');
+    $same(0,count($postAck['inner']->calls),'post-response schema failure performs no external HTTP');
+    $postAckRestart=$child('--cycle',$postAck);
+    $same(1,$postAckRestart['cycle']['jobs_processed'],'maintenance initialization restores schema and recovers proof');
+    $same(1,$postAckRestart['callbacks'],'recovered post-ACK job runs exactly once');
+    $same('done',$state($postAck,$postAckJob)['state'],'recovered post-ACK job finishes');
+    $same(0,count($markers($postAck)),'recovered post-ACK proof is cleaned');
+    $scenarios['post_ack_schema_loss']=['ack_emitted'=>true,'http_schema_repair'=>false,'durable_proof'=>true,'maintenance_recovered'=>true,'followups'=>1];
+
+    $postClient=$make('post_ack_client_schema_loss');[$postClientDelivery,$postClientJob]=$prepare($postClient,new AckRecoveryDriver());$clientAckEmitted=false;
+    $postClientDriver=new AckRecoveryDriver(null,true,false,static function()use($postClient,&$clientAckEmitted,$same):void{
+        $same(true,$clientAckEmitted,'client-schema hook runs only after fake ACK emit');
+        $postClient['context']->db->pdo()->exec('DROP TABLE operation_receipts');
+    });
+    $same(true,$postClientDelivery->deliver($postClientDriver,static function(Response $response)use(&$clientAckEmitted):void{$clientAckEmitted=true;}),'ACK remains delivered when client schema validation fails');
+    $same(0,(int)$postClient['context']->db->pdo()->query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='operation_receipts'")->fetchColumn(),'post-response HTTP does not recreate client table');
+    $same(1,count($markers($postClient)),'client-schema failure keeps durable finish proof');
+    $same('pending',$state($postClient,$postClientJob)['state'],'client-schema failure leaves job pending');
+    $same(0,count($postClient['inner']->calls),'client-schema failure performs no external HTTP');
+    $postClientRestart=$child('--cycle',$postClient);
+    $same(1,$postClientRestart['cycle']['jobs_processed'],'maintenance restores client schema and recovers proof');
+    $same(1,$postClientRestart['callbacks'],'client-schema recovery runs exactly once');
+    $same('done',$state($postClient,$postClientJob)['state'],'client-schema recovery finishes');
+    $same(0,count($markers($postClient)),'client-schema recovery cleans proof');
+
     // Original defect: the writer stays locked throughout the HTTP post-response attempt.
     $f=$make('locked');$assert(OperationsConfig::ready($f['config']),'full-feature configuration ready');
     $same('best_effort',$f['config']['closure_policy'],'normal closure policy');$same('guild',$f['config']['participant_scope'],'normal guild scope');
     foreach(['operations_enabled','participant_commands_enabled','live_automation_enabled','posts_enabled','room_permissions_enabled','roles_enabled','achievement_notifications_enabled','member_actions_enabled','accept_voice_race_risk','periodic_worker_enabled']as$key){$same(true,$f['config'][$key],'full normal feature '.$key);}
     $locker=new PDO('sqlite:'.$f['config']['private_db_path']);$locker->setAttribute(PDO::ATTR_ERRMODE,PDO::ERRMODE_EXCEPTION);
-    $locker->exec('BEGIN IMMEDIATE');[$blocked,$blockedId]=$prepare($f,new AckRecoveryDriver());$locker->exec('ROLLBACK');
+    $locker->exec('BEGIN IMMEDIATE');$lockStarted=hrtime(true);[$blocked,$blockedId]=$prepare($f,new AckRecoveryDriver());$lockMs=(hrtime(true)-$lockStarted)/1000000;$locker->exec('ROLLBACK');
     $same(503,$blocked->response->status,'pre-ACK writer lock fails closed');$same([],$state($f,$blockedId),'pre-ACK failure did not enqueue');$same(0,count($markers($f)),'pre-ACK failure has no proof');
+    $assert($lockMs<2500,'pre-ACK writer lock remains below Discord deadline');
     $driver=new AckRecoveryDriver($locker);[$delivery,$id]=$prepare($f,$driver,'radio-attend');
     $same(['type'=>5,'data'=>['flags'=>64]],$delivery->response->body,'normal defer prepared');
     $same(true,$delivery->deliver($driver,$emit),'post-response failure is durably handed off');
@@ -202,7 +319,7 @@ try{
     $result=['status'=>'ACK_RECOVERY_LOCAL_VERIFIED_NOT_DEPLOYED','assertions'=>$checks,'real_network_calls'=>0,'server_commands'=>0,'deployed'=>false,
         'full_operational_flags'=>true,'closure_policy'=>'best_effort','participant_scope'=>'guild','command_registration_enabled'=>false,'scenarios'=>$scenarios,
         'limits'=>['finish_to_first_durable_write_crash_window'=>true,'directory_power_loss_guarantee'=>false,'windows_posix_mode_equivalence'=>false]];
-    $destination=getenv('RADIO_STAMP_TEST_ARTIFACT_DIR');if(!is_dir($destination)){mkdir($destination,0700,true);}
+    $destination=getenv('RADIO_STAMP_TEST_ARTIFACT_DIR')?:dirname(__DIR__).'/deployment/five-slot-stamps-local-20261020/focused';if(!is_dir($destination)){mkdir($destination,0700,true);}
     file_put_contents($destination.'/ack-recovery.safe.json',json_encode($result,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR)."\n");
     echo "ACK recovery: $checks assertions passed (durable finish proof, restart, independent expiry, tamper and parallel import; fake only).\n";
 }finally{

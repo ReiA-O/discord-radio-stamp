@@ -13,13 +13,30 @@ final class GatewayRosterSession implements VoiceRosterSource
     private ?int $sequence=null;private float $interval=45;private float $nextHeartbeat=0;private ?float $awaitingSince=null;
     private array $versions=[];private int $epoch;private \Closure $monotonic;
     private ?string $failure=null;private bool $cleanupFailed=false;private ?\Closure $failureReporter=null;
+    public static function openExisting(Database $db,ServerOperationsClient $client,Clock $clock,#[\SensitiveParameter] string $botToken,
+        \Closure $transportFactory,\Closure $guard,?callable $monotonic=null):self
+    {
+        return new self($db,$client,$clock,$botToken,$transportFactory,$guard,$monotonic,false);
+    }
+
+    /** Read-only storage contract, usable before constructing a Gateway tracker or transport. */
+    public static function requireExistingSchema(PDO $pdo):void
+    {
+        Database::requireTable($pdo,'gateway_identify_budget',['day'=>['TEXT',0,null,1],'attempts'=>['INTEGER',1,null,0],'last_attempt'=>['REAL',1,null,0]]);
+        Database::requireTable($pdo,'gateway_closure_attempts',['session_id'=>['TEXT',0,null,1],'attempts'=>['INTEGER',1,null,0]]);
+    }
+
     public function __construct(private Database $db,private ServerOperationsClient $client,private Clock $clock,
-        #[\SensitiveParameter] private string $botToken,private \Closure $transportFactory,private \Closure $guard,?callable $monotonic=null)
+        #[\SensitiveParameter] private string $botToken,private \Closure $transportFactory,private \Closure $guard,?callable $monotonic=null,bool $initializeStorage=true)
     {
         $this->tracker=new GatewayVoiceTracker($clock,120);$this->epoch=random_int(1,1000000000);
         $this->monotonic=$monotonic===null?static fn():float=>hrtime(true)/1e9:\Closure::fromCallable($monotonic);
-        $db->pdo()->exec('CREATE TABLE IF NOT EXISTS gateway_identify_budget(day TEXT PRIMARY KEY,attempts INTEGER NOT NULL,last_attempt REAL NOT NULL)');
-        $db->pdo()->exec('CREATE TABLE IF NOT EXISTS gateway_closure_attempts(session_id TEXT PRIMARY KEY,attempts INTEGER NOT NULL)');
+        if($initializeStorage){
+            $db->pdo()->exec('CREATE TABLE IF NOT EXISTS gateway_identify_budget(day TEXT PRIMARY KEY,attempts INTEGER NOT NULL,last_attempt REAL NOT NULL)');
+            $db->pdo()->exec('CREATE TABLE IF NOT EXISTS gateway_closure_attempts(session_id TEXT PRIMARY KEY,attempts INTEGER NOT NULL)');
+        }else{
+            self::requireExistingSchema($db->pdo());
+        }
     }
     public function __debugInfo():array{return ['connected'=>$this->connected,'ready'=>$this->ready,'credentials'=>'[redacted]','voice_connection'=>false];}
     public function active():bool{return $this->connected;}
@@ -148,3 +165,4 @@ final class GatewayRosterSession implements VoiceRosterSource
     }
     public function __destruct(){$this->close();}
 }
+

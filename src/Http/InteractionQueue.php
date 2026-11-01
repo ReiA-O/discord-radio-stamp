@@ -8,8 +8,11 @@ use RadioStamp\Security\TokenCipher;
 final class InteractionQueue
 {
     private ?string $instanceId=null;
-    public function __construct(private readonly PDO $pdo, private readonly TokenCipher $cipher)
+    public static function openExisting(PDO $pdo,TokenCipher $cipher):self{return new self($pdo,$cipher,false);}
+
+    public function __construct(private readonly PDO $pdo, private readonly TokenCipher $cipher,private readonly bool $initializeSchema=true)
     {
+        if(!$this->initializeSchema){$this->requireExistingSchema();return;}
         $pdo->exec('CREATE TABLE IF NOT EXISTS interaction_jobs (
             interaction_id TEXT PRIMARY KEY,
             action TEXT NOT NULL,
@@ -46,6 +49,53 @@ final class InteractionQueue
         }
         if(!is_string($instance)||preg_match('/\A[0-9a-f]{64}\z/D',$instance)!==1){throw new \RuntimeException('ack_handoff_unavailable');}
         $this->instanceId=$instance;
+    }
+
+    /** Validate the queue contract without CREATE, ALTER or provisioning writes. */
+    private function requireExistingSchema():void
+    {
+        $this->requireTable('interaction_jobs',[
+            'interaction_id'=>['TEXT',0,null,1],'action'=>['TEXT',1,null,0],'target'=>['TEXT',1,null,0],
+            'user_id'=>['TEXT',1,null,0],'display_name'=>['TEXT',1,null,0],'request_hash'=>['TEXT',1,null,0],
+            'scope_mode'=>['TEXT',1,'mock',0],'token_ciphertext'=>['TEXT',1,null,0],'created_at'=>['INTEGER',1,null,0],
+            'state'=>['TEXT',1,'pending',0],'attempts'=>['INTEGER',1,'0',0],'lease_id'=>['TEXT',0,null,0],
+            'claimed_at'=>['INTEGER',0,null,0],'available_at'=>['INTEGER',1,'0',0],'result_code'=>['TEXT',0,null,0],
+        ]);
+        $this->requireTable('operations_ack_receipts',[
+            'interaction_id'=>['TEXT',0,null,1],'finished_at'=>['INTEGER',1,null,0],
+        ]);
+        $this->requireTable('operations_queue_instance',[
+            'name'=>['TEXT',0,null,1],'instance_id'=>['TEXT',1,null,0],
+        ]);
+        $instance=$this->pdo->query("SELECT instance_id FROM operations_queue_instance WHERE name='operations'")->fetchColumn();
+        if(!is_string($instance)||preg_match('/\A[0-9a-f]{64}\z/D',$instance)!==1){throw new \RuntimeException('private_queue_schema_unavailable');}
+        $this->instanceId=$instance;
+    }
+
+    private function requireTable(string $table,array $expected):void
+    {
+        $type=$this->pdo->prepare('SELECT type FROM sqlite_master WHERE name=?');$type->execute([$table]);
+        if($type->fetchColumn()!=='table'){throw new \RuntimeException('private_queue_schema_unavailable');}
+        $rows=$this->pdo->query('PRAGMA table_info('.$table.')')->fetchAll(PDO::FETCH_ASSOC);
+        $columns=[];$primary=[];
+        foreach($rows as$row){$columns[$row['name']]=$row;if((int)$row['pk']>0){$primary[]=$row['name'];}}
+        foreach($expected as$name=>$contract){
+            $row=$columns[$name]??null;
+            if(!is_array($row)||strtoupper((string)$row['type'])!==$contract[0]||(int)$row['notnull']!==$contract[1]
+                ||$this->schemaDefault($row['dflt_value'])!==$contract[2]||(int)$row['pk']!==$contract[3]){
+                throw new \RuntimeException('private_queue_schema_unavailable');
+            }
+        }
+        $requiredPrimary=array_keys(array_filter($expected,static fn(array $contract):bool=>$contract[3]>0));
+        if($primary!==$requiredPrimary){throw new \RuntimeException('private_queue_schema_unavailable');}
+    }
+
+    private function schemaDefault(mixed $value):?string
+    {
+        if($value===null){return null;}$value=trim((string)$value);
+        while(strlen($value)>1&&$value[0]==='('&&$value[strlen($value)-1]===')'){$value=trim(substr($value,1,-1));}
+        if(strlen($value)>1&&(($value[0]==="'"&&$value[strlen($value)-1]==="'")||($value[0]==='"'&&$value[strlen($value)-1]==='"'))){$value=substr($value,1,-1);}
+        return $value;
     }
 
     public function acknowledgementMetadata(string $id):?array

@@ -3,12 +3,27 @@ declare(strict_types=1);
 namespace RadioStamp\Discord;
 
 use PDO;
+use RadioStamp\Core\Database;
 
 /** Use the private application SQLite connection; this stores no credentials or payloads. */
 final class RestStateStore
 {
-    public function __construct(private readonly PDO $pdo)
+    public static function openExisting(PDO $pdo):self{return new self($pdo,false);}
+
+    /** Structural preflight only; never creates tables, changes journals, or seeds state. */
+    public static function requireExistingSchema(PDO $pdo):void
     {
+        Database::requireTable($pdo,'discord_rest_limits',['limit_key'=>['TEXT',0,null,1],'until_at'=>['REAL',1,null,0]]);
+        Database::requireTable($pdo,'discord_rest_routes',['route_key'=>['TEXT',0,null,1],'bucket_key'=>['TEXT',1,null,0]]);
+        Database::requireTable($pdo,'discord_rest_commands',['command_key'=>['TEXT',0,null,1],'attempts'=>['INTEGER',1,'0',0],'state'=>['TEXT',1,'pending',0],'lease_until'=>['REAL',1,'0',0],'retry_at'=>['REAL',1,'0',0]]);
+    }
+
+    public function __construct(private readonly PDO $pdo,bool $initializeStorage=true)
+    {
+        if(!$initializeStorage){
+            self::requireExistingSchema($pdo);
+            return;
+        }
         $pdo->exec('CREATE TABLE IF NOT EXISTS discord_rest_limits (limit_key TEXT PRIMARY KEY, until_at REAL NOT NULL)');
         $pdo->exec('CREATE TABLE IF NOT EXISTS discord_rest_routes (route_key TEXT PRIMARY KEY, bucket_key TEXT NOT NULL)');
         $pdo->exec("CREATE TABLE IF NOT EXISTS discord_rest_commands (command_key TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending', lease_until REAL NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0)");
@@ -59,3 +74,4 @@ final class RestStateStore
         $query->execute([$key, $ok ? 'done' : 'pending', $retryAt, $terminal ? 3 : 0, $terminal ? 1 : 0]);
     }
 }
+
