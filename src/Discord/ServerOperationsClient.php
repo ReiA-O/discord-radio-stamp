@@ -487,7 +487,7 @@ final class ServerOperationsClient
             if(!is_array($data)){return new RestResult(false,'response_invalid');}
             $headers=[];foreach($response->headers as$key=>$value){if(is_string($key)&&(is_string($value)||is_int($value))){$headers[strtolower($key)]=(string)$value;}}
             // Body retry_after, else a valid Retry-After header; missing/invalid guidance is a short route pause, never global.
-            $retry=null;foreach([$jsonValid?($data['retry_after']??null):null,$headers['retry-after']??null]as$candidate){if($retry===null&&is_numeric($candidate)&&is_finite((float)$candidate)&&(float)$candidate>=0){$retry=max(0.25,min(3600.0,(float)$candidate));}}
+            $retry=null;foreach([$jsonValid?($data['retry_after']??null):null,$headers['retry-after']??null]as$candidate){if($retry===null&&is_numeric($candidate)&&is_finite((float)$candidate)&&(float)$candidate>=0){$retry=max(0.25,min(RestStateStore::MAX_RETRY_AFTER,(float)$candidate));}}
             $retry??=$response->status===429?60.0:1.0;
             $this->limits->observe($route,$route,$headers,$response->status,$retry,($data['global']??false)===true||($headers['x-ratelimit-global']??'')==='true'||($headers['x-ratelimit-scope']??'')==='global',($this->now)());
             if($response->status===401){$this->authenticationFailed=true;}

@@ -172,7 +172,7 @@ foreach(['observation_expired','source_guard_rejected','worker_guard_exhausted',
     $options=['enabled'=>true,'member_actions_enabled'=>true,'accept_voice_race_risk'=>true,'now'=>fn():float=>$control->now,'monotonic'=>fn():float=>$http->mono,
         'request_guard'=>fn():bool=>$http->permit,'source_guard'=>fn(string $unused,?MemberActionFence $f):bool=>($case!=='source_guard_rejected'||$control->source)&&$f?->generation===$control->generation];
     $client=new ServerOperationsClient($db,$http,'fictional_unsent_token_000000',$options);
-    if($case==='local_rate_cooldown'){$db->pdo()->exec("INSERT INTO discord_rest_limits(limit_key,until_at) VALUES('route:member:voice',1001)");}
+    if($case==='local_rate_cooldown'){$db->pdo()->exec("INSERT INTO discord_rest_limits(limit_key,until_at) VALUES('v2:route:member:voice',1001)");}
     $key='disconnect:2026-10-20_1430:'.$user;$first=$client->tryRelocate($user,null,$key,new MemberActionFence(DiscordRestClient::GUILD_ID,$user,$voice,1,1000));
     $same(false,$first->ok,$case.' refuses first attempt');$same(TransportOutcome::NotStarted,$first->outcome,$case.' proves mutation transport not started');
     $same(0,$http->attempts['member']??0,$case.' no first PATCH');$same(0,(int)$db->pdo()->query('SELECT COUNT(*) FROM operation_receipts')->fetchColumn(),$case.' owned unsent claim released');
