@@ -55,4 +55,3 @@ RADIO_STAMP_TEST_ARTIFACT_DIR="$(mktemp -d)" php -d memory_limit=128M tests/run.
 Issue/PRは[CONTRIBUTING.md](CONTRIBUTING.md)の手順でお願いします。秘密や実参加データ、管理画面の個人情報を貼らず、架空の再現例を使ってください。ライセンスはまだ未設定です。
 
 実設定・SQLite/WAL/backup・運用/診断ログ・元report・過去配備資料・個人パス・実機観測資料・画像アーカイブ・認証保存領域は保存しません。GitHub Pages、CI/CDによる本番配備、リポジトリからのCron/worker自動起動も設定していません。
-
