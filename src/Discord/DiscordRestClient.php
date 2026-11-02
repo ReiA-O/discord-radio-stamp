@@ -268,16 +268,15 @@ final class DiscordRestClient
             foreach ($response->headers as $key => $value) {
                 if (is_string($key) && (is_string($value) || is_int($value))) { $rateHeaders[strtolower($key)] = (string) $value; }
             }
-            $durations = []; $invalidRate = false;
+            // Invalid values are ignored; a 429 without any valid guidance is a short route pause, never global.
+            $durations = [];
             foreach ([$rateHeaders['retry-after'] ?? null, $data['retry_after'] ?? null] as $duration) {
-                if ($duration === null) { continue; }
-                if (!is_numeric($duration) || !is_finite((float) $duration) || (float) $duration < 0) { $invalidRate = true; continue; }
-                $durations[] = (float) $duration;
+                if ($duration === null || !is_numeric($duration) || !is_finite((float) $duration) || (float) $duration < 0) { continue; }
+                $durations[] = min(3600.0, (float) $duration);
             }
-            if ($response->status === 429 && $durations === []) { $invalidRate = true; }
-            $retry = max(0.25, ...($durations === [] ? [1.0] : $durations));
-            if ($invalidRate) { $retry = max(86400.0, $retry); }
-            $global = $invalidRate || ($data['global'] ?? false) === true || strtolower($rateHeaders['x-ratelimit-global'] ?? '') === 'true' || ($rateHeaders['x-ratelimit-scope'] ?? '') === 'global';
+            $invalidRate = $response->status === 429 && $durations === [];
+            $retry = $invalidRate ? 60.0 : max(0.25, ...($durations === [] ? [1.0] : $durations));
+            $global = ($data['global'] ?? false) === true || strtolower($rateHeaders['x-ratelimit-global'] ?? '') === 'true' || ($rateHeaders['x-ratelimit-scope'] ?? '') === 'global';
             $this->store->observe($route, $major, $rateHeaders, $response->status, $retry, $global, $receivedAt);
             if ($botAuth && $response->status === 401) { $this->authenticationFailed = true; }
             if ($response->status >= 200 && $response->status < 300) {

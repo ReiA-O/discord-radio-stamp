@@ -8,6 +8,10 @@ use RadioStamp\Core\Database;
 /** Use the private application SQLite connection; this stores no credentials or payloads. */
 final class RestStateStore
 {
+    /** Longest cooldown ever stored or honoured; Discord's ordinary limits reset well within an hour. */
+    private const MAX_COOLDOWN = 3600.0;
+    /** Interaction webhook endpoints are not bound by the bot's global rate limit. */
+    private const INTERACTION_ROUTES = ['interaction_edit'];
     public static function openExisting(PDO $pdo):self{return new self($pdo,false);}
 
     /** Structural preflight only; never creates tables, changes journals, or seeds state. */
@@ -30,9 +34,10 @@ final class RestStateStore
     }
     public function cooldown(string $route, float $now): float
     {
-        $query = $this->pdo->prepare('SELECT MAX(until_at) FROM discord_rest_limits WHERE limit_key IN (?, ?, COALESCE((SELECT bucket_key FROM discord_rest_routes WHERE route_key=?), ?))');
-        $query->execute(['global', 'route:' . $route, $route, 'none']);
-        return max(0.0, (float) $query->fetchColumn() - $now);
+        // Rows beyond now+MAX_COOLDOWN can only come from an older release (or a clock step) and are ignored.
+        $query = $this->pdo->prepare('SELECT MAX(until_at) FROM discord_rest_limits WHERE until_at<=? AND limit_key IN (?, ?, COALESCE((SELECT bucket_key FROM discord_rest_routes WHERE route_key=?), ?))');
+        $query->execute([$now + self::MAX_COOLDOWN, in_array($route, self::INTERACTION_ROUTES, true) ? 'none' : 'global', 'route:' . $route, $route, 'none']);
+        return min(self::MAX_COOLDOWN, max(0.0, (float) $query->fetchColumn() - $now));
     }
     public function observe(string $route, string $major, array $headers, int $status, float $retryAfter, bool $global, float $now): void
     {
@@ -42,19 +47,22 @@ final class RestStateStore
             $map = $this->pdo->prepare('INSERT INTO discord_rest_routes(route_key,bucket_key) VALUES (?,?) ON CONFLICT(route_key) DO UPDATE SET bucket_key=excluded.bucket_key');
             $map->execute([$route, $bucket]);
         }
-        $reset = is_numeric($headers['x-ratelimit-reset-after'] ?? null) && is_finite((float) $headers['x-ratelimit-reset-after']) && (float) $headers['x-ratelimit-reset-after'] >= 0 ? (float) $headers['x-ratelimit-reset-after'] : 86400.0;
-        if (($headers['x-ratelimit-remaining'] ?? null) === '0' && $reset > 0) { $this->putLimit($bucket, $this->until($now, $reset)); }
+        $reset = is_numeric($headers['x-ratelimit-reset-after'] ?? null) && is_finite((float) $headers['x-ratelimit-reset-after']) && (float) $headers['x-ratelimit-reset-after'] >= 0 ? (float) $headers['x-ratelimit-reset-after'] : 5.0;
+        if (($headers['x-ratelimit-remaining'] ?? null) === '0' && $reset > 0) { $this->putLimit($bucket, $this->until($now, $reset), $now); }
         if ($status === 429) {
-            $this->putLimit($global ? 'global' : $bucket, $this->until($now, max(0.25, $retryAfter)));
+            // An interaction route never writes the bot-wide global limit it is exempt from.
+            $global = $global && !in_array($route, self::INTERACTION_ROUTES, true);
+            $this->putLimit($global ? 'global' : $bucket, $this->until($now, max(0.25, $retryAfter)), $now);
             // Route fallback protects requests before a bucket has been learned.
-            $this->putLimit('route:' . $route, $this->until($now, max(0.25, $retryAfter)));
+            $this->putLimit('route:' . $route, $this->until($now, max(0.25, $retryAfter)), $now);
         }
     }
-    private function until(float $now, float $duration): float { $until = $now + $duration; return is_finite($until) ? $until : PHP_FLOAT_MAX; }
-    private function putLimit(string $key, float $until): void
+    private function until(float $now, float $duration): float { return $now + (is_finite($duration) ? max(0.0, min(self::MAX_COOLDOWN, $duration)) : self::MAX_COOLDOWN); }
+    private function putLimit(string $key, float $until, float $now): void
     {
-        $query = $this->pdo->prepare('INSERT INTO discord_rest_limits(limit_key,until_at) VALUES (?,?) ON CONFLICT(limit_key) DO UPDATE SET until_at=MAX(until_at,excluded.until_at)');
-        $query->execute([$key, $until]);
+        // A stale row beyond the cap (older release) is replaced instead of being kept by MAX().
+        $query = $this->pdo->prepare('INSERT INTO discord_rest_limits(limit_key,until_at) VALUES (?,?) ON CONFLICT(limit_key) DO UPDATE SET until_at=CASE WHEN discord_rest_limits.until_at>? THEN excluded.until_at ELSE MAX(discord_rest_limits.until_at,excluded.until_at) END');
+        $query->execute([$key, $until, $now + self::MAX_COOLDOWN]);
     }
     /** Atomic per-definition lease and a total cap of three HTTP attempts. */
     public function claimCommand(string $key, float $now): string

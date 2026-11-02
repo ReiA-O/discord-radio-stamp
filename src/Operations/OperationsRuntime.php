@@ -11,6 +11,10 @@ use RadioStamp\Security\TokenCipher;
 /** All runtime wiring is explicit. Constructors do not make HTTP or WSS requests. */
 final class OperationsRuntime
 {
+    /** Pre-ACK: one autocommit enqueue INSERT may wait this long and still answer well inside Discord's 3 s window. */
+    private const INGRESS_BUSY_TIMEOUT_MS=1500;
+    /** Post-ACK worker and cron: no response deadline, so ride out a concurrent writer instead of failing. */
+    private const WORKER_BUSY_TIMEOUT_MS=5000;
     private Clock $clock;
     public function __construct(private ?HttpAdapter $http=null,private ?\Closure $transportFactory=null,?Clock $clock=null){$this->clock=$clock??new SystemClock();}
     public function clock():Clock{return $this->clock;}
@@ -33,12 +37,12 @@ final class OperationsRuntime
         if(!$validatorsAvailable){
             // Old constructors retain strict freshness/schema validation. Keep
             // their existing no-initialization path and buffer diagnostics.
-            $context=$this->build($config,static fn():bool=>true,null,SafeDiagnostics::fromConfig($config,null,null,true),false);
+            $context=$this->build($config,static fn():bool=>true,null,SafeDiagnostics::fromConfig($config,null,null,true),false,self::INGRESS_BUSY_TIMEOUT_MS);
             try{return ['queue'=>$context->queue,'handoff'=>$context->handoff];}
             finally{$context->roster->close();}
         }
         RadioService::requireValidRosterFreshness($config);
-        $db=Database::openExisting($config['private_db_path'],200);
+        $db=Database::openExisting($config['private_db_path'],self::INGRESS_BUSY_TIMEOUT_MS);
         // Keep the established fail-before-enqueue storage contract without
         // constructing REST, Gateway, service, renderer or worker objects.
         RestStateStore::requireExistingSchema($db->pdo());
@@ -47,11 +51,11 @@ final class OperationsRuntime
         $queue=InteractionQueue::openExisting($db->pdo(),new TokenCipher($config['token_encryption_key_hex']));
         return ['queue'=>$queue,'handoff'=>AckHandoff::openExisting($config)];
     }
-    public function build(#[\SensitiveParameter] array $config,\Closure $outerGuard,?float $deadline=null,?SafeDiagnostics $diagnostics=null,bool $initializeStorage=true):OperationsContext
+    public function build(#[\SensitiveParameter] array $config,\Closure $outerGuard,?float $deadline=null,?SafeDiagnostics $diagnostics=null,bool $initializeStorage=true,int $busyTimeoutMs=self::WORKER_BUSY_TIMEOUT_MS):OperationsContext
     {
         if(!OperationsConfig::ready($config)){throw new \RuntimeException('operations_configuration_unavailable');}
         $diagnostics??=SafeDiagnostics::fromConfig($config);
-        $db=$initializeStorage?new Database($config['private_db_path'],200):Database::openExisting($config['private_db_path'],200);
+        $db=$initializeStorage?new Database($config['private_db_path'],$busyTimeoutMs):Database::openExisting($config['private_db_path'],$busyTimeoutMs);
         $http=$this->http??new CurlHttpAdapter();$session=null;
         $guard=static function()use($outerGuard,&$session):bool{
             if($outerGuard()!==true){return false;}if($session?->active()){$session->pump();}return true;
