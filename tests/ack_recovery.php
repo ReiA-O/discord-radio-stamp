@@ -203,6 +203,10 @@ try{
     // Original defect: the writer stays locked throughout the HTTP post-response attempt.
     $f=$make('locked');$assert(OperationsConfig::ready($f['config']),'full-feature configuration ready');
     $same('best_effort',$f['config']['closure_policy'],'normal closure policy');$same('guild',$f['config']['participant_scope'],'normal guild scope');
+    $ingressQueue=$f['runtime']->prepareIngress($f['config'])['queue'];$ingressPdo=(new ReflectionProperty(InteractionQueue::class,'pdo'))->getValue($ingressQueue);
+    $same(1500,(int)$ingressPdo->query('PRAGMA busy_timeout')->fetchColumn(),'pre-ACK ingress waits up to 1.5 s for a writer, well inside the 3 s ACK window');
+    $same(5000,(int)$f['context']->db->pdo()->query('PRAGMA busy_timeout')->fetchColumn(),'post-ACK worker and cron connections wait up to 5 s');
+    unset($ingressQueue,$ingressPdo);
     foreach(['operations_enabled','participant_commands_enabled','live_automation_enabled','posts_enabled','room_permissions_enabled','roles_enabled','achievement_notifications_enabled','member_actions_enabled','accept_voice_race_risk','periodic_worker_enabled']as$key){$same(true,$f['config'][$key],'full normal feature '.$key);}
     $locker=new PDO('sqlite:'.$f['config']['private_db_path']);$locker->setAttribute(PDO::ATTR_ERRMODE,PDO::ERRMODE_EXCEPTION);
     $locker->exec('BEGIN IMMEDIATE');$lockStarted=hrtime(true);[$blocked,$blockedId]=$prepare($f,new AckRecoveryDriver());$lockMs=(hrtime(true)-$lockStarted)/1000000;$locker->exec('ROLLBACK');
