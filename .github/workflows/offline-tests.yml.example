@@ -1,0 +1,39 @@
+# PROPOSAL ONLY: not an active workflow. Review before renaming to .yml.
+# Third-party setup action must be pinned to an independently verified full SHA.
+name: Offline PHP checks (proposal)
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@<VERIFIED_FULL_COMMIT_SHA>
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@<VERIFIED_FULL_COMMIT_SHA>
+        with:
+          php-version: '8.3'
+          extensions: curl, gd, sodium, pdo_sqlite, sqlite3, mbstring
+          coverage: none
+          ini-values: memory_limit=128M
+      - name: Install Japanese font for card tests
+        run: sudo apt-get update && sudo apt-get install -y fonts-ipafont-gothic
+      - name: Record runtime
+        run: php --version && php -r 'echo SQLite3::version()["versionString"], PHP_EOL;'
+      - name: Syntax check
+        run: find . -name '*.php' -type f -print0 | xargs -0 -n1 php -l
+      - name: Isolated fake-adapter tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RADIO_STAMP_TEST_ARTIFACT_DIR="$(mktemp -d)"
+          trap 'rm -rf "$RADIO_STAMP_TEST_ARTIFACT_DIR"' EXIT
+          php -d memory_limit=128M tests/run.php
+# No secrets, production endpoints, deployment, permissions changes or artifacts.
+# Fake adapters are a test-design boundary, not an OS network sandbox.
+# Add an approved network-isolation approach if a hard no-network guarantee is required.
+
