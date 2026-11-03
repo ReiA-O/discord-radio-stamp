@@ -20,6 +20,13 @@ $files[] = 'one_join_scoped_permissions.php';
 $files[] = 'weekly_ranking.php';
 $files[] = 'opening_notice.php';
 $files[] = 'prelaunch_gate.php';
+$files[] = 'ingress_preflight_contract.php';
+$files[] = 'checkpoint_contract.php';
+$files[] = 'ingress_buffer.php';
+$files[] = 'attend_boundary.php';
+$files[] = 'participant_command_access.php';
+$files[] = 'always_open.php';
+$files[] = 'outbound_mentions.php';
 foreach ($files as $name) {
     $path = __DIR__ . '/' . $name;
     if (!is_file($path)) { fwrite(STDERR, "MISSING: $name\n"); $failures++; continue; }

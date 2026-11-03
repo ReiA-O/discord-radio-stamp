@@ -16,6 +16,7 @@ final class OperationsConfig
     ];
     public static function ready(array $config):bool
     {
+        if(!in_array($config['room_access_mode']??'time_gated',['time_gated','always_open'],true)){return false;}
         if(array_key_exists('weekly_ranking_enabled',$config)&&!is_bool($config['weekly_ranking_enabled'])){return false;}
         if(isset($config['owner_user_id'])&&!PrivateConfig::snowflake($config['owner_user_id'])){return false;}
         try { \RadioStamp\Core\Schedule::fromConfig($config); } catch (\Throwable) { return false; }
@@ -28,7 +29,7 @@ final class OperationsConfig
             ||($config['records_channel_id']??null)!==DiscordRestClient::RECORDS_CHANNEL_ID||($config['destination_channel_id']??null)!==ServerOperationsClient::DESTINATION_ID
             ||($config['timezone']??null)!=='Asia/Tokyo'||!ParticipantScope::valid($config)) { return false; }
         foreach(['posts_enabled','roles_enabled','room_permissions_enabled','member_actions_enabled','accept_voice_race_risk','periodic_worker_enabled','achievement_notifications_enabled','command_registration_enabled']as$key){if(!is_bool($config[$key]??null)){return false;}}
-        if(!$config['posts_enabled']||!$config['room_permissions_enabled']){return false;}
+        if(!$config['posts_enabled']||(self::alwaysOpen($config)?$config['room_permissions_enabled']:!$config['room_permissions_enabled'])){return false;}
         $policy=$config['closure_policy']??null;
         if(!in_array($policy,['manual','best_effort'],true)||($policy==='manual'&&($config['member_actions_enabled']||$config['accept_voice_race_risk']))
             ||($policy==='best_effort'&&(!$config['member_actions_enabled']||!$config['accept_voice_race_risk']))){return false;}
@@ -37,15 +38,18 @@ final class OperationsConfig
             ||($config['achievement_notifications_enabled']&&!$config['roles_enabled'])){return false;}
         foreach($roles as$threshold=>$id){if(!isset(\RadioStamp\Core\TitlePolicy::TITLES[$threshold])||!PrivateConfig::snowflake($id)){return false;}}
         if($config['roles_enabled']&&array_diff_assoc($roles,self::TITLE_ROLE_IDS)!==[]){return false;}
-        $baseline=$config['room_baseline']??null;
-        if(!is_array($baseline)){return false;}
-        foreach(['allow','deny']as$key){if(!is_string($baseline[$key]??null)||preg_match('/\A(?:0|[1-9][0-9]{0,18})\z/D',$baseline[$key])!==1||strlen($baseline[$key])===19&&strcmp($baseline[$key],(string)PHP_INT_MAX)>0){return false;}}
+        if(!self::alwaysOpen($config)){
+            $baseline=$config['room_baseline']??null;
+            if(!is_array($baseline)){return false;}
+            foreach(['allow','deny']as$key){if(!is_string($baseline[$key]??null)||preg_match('/\A(?:0|[1-9][0-9]{0,18})\z/D',$baseline[$key])!==1||strlen($baseline[$key])===19&&strcmp($baseline[$key],(string)PHP_INT_MAX)>0){return false;}}
+        }
         return is_string($config['bot_token']??null)&&preg_match('/\A[A-Za-z0-9._-]{20,256}\z/D',$config['bot_token'])===1
             &&is_string($config['public_key_hex']??null)&&preg_match('/\A[0-9a-fA-F]{64}\z/D',$config['public_key_hex'])===1
             &&is_string($config['token_encryption_key_hex']??null)&&preg_match('/\A[0-9a-fA-F]{64}\z/D',$config['token_encryption_key_hex'])===1
             &&is_string($config['private_db_path']??null)&&$config['private_db_path']!==''
             &&is_array($config['font_candidates']??null);
     }
+    public static function alwaysOpen(array $config):bool{return ($config['room_access_mode']??'time_gated')==='always_open';}
     public static function load(string $path,string $publicRoot,bool $operational=true):array
     {
         $config=PrivateConfig::load($path,$publicRoot,false,$operational?self::ready(...):self::storageReady(...));

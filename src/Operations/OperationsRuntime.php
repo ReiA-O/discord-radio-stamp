@@ -3,7 +3,7 @@ declare(strict_types=1);
 namespace RadioStamp\Operations;
 
 use RadioStamp\Core\{Database,Clock,SystemClock,RadioService,WeeklyRanking};
-use RadioStamp\Discord\{HttpAdapter,CurlHttpAdapter,DiscordRestClient,ServerOperationsClient,ServerOperationsGateway,GatewayRosterSession,TlsGatewayTransport,MemberActionFence};
+use RadioStamp\Discord\{HttpAdapter,CurlHttpAdapter,DiscordRestClient,RestStateStore,ServerOperationsClient,ServerOperationsGateway,GatewayRosterSession,TlsGatewayTransport,MemberActionFence};
 use RadioStamp\Http\{InteractionQueue,InteractionWorker,DiscordRestFollowupSink};
 use RadioStamp\Cards\CardRenderer;
 use RadioStamp\Security\TokenCipher;
@@ -11,30 +11,79 @@ use RadioStamp\Security\TokenCipher;
 /** All runtime wiring is explicit. Constructors do not make HTTP or WSS requests. */
 final class OperationsRuntime
 {
+    /** Pre-ACK: one autocommit enqueue INSERT may wait this long and still answer well inside Discord's 3 s window. */
+    private const INGRESS_BUSY_TIMEOUT_MS=1500;
+    /** Post-ACK worker and cron: no response deadline, so ride out a concurrent writer instead of failing. */
+    private const WORKER_BUSY_TIMEOUT_MS=5000;
     private Clock $clock;
     public function __construct(private ?HttpAdapter $http=null,private ?\Closure $transportFactory=null,?Clock $clock=null){$this->clock=$clock??new SystemClock();}
     public function clock():Clock{return $this->clock;}
-    public function build(#[\SensitiveParameter] array $config,\Closure $outerGuard,?float $deadline=null,?SafeDiagnostics $diagnostics=null):OperationsContext
+    /**
+     * Build only the durable ingress primitives required before the ACK.
+     * Voice, REST, worker, renderer, roster and ranking objects are post-ACK work.
+     *
+     * @return array{queue:InteractionQueue,handoff:AckHandoff}
+     */
+    public function prepareIngress(#[\SensitiveParameter] array $config):array
+    {
+        if(!OperationsConfig::ready($config)){throw new \RuntimeException('operations_configuration_unavailable');}
+        // Each feature check autoloads and pins that class for this request.
+        // Check every dependency before invoking any newly added static API.
+        $validatorsAvailable=true;
+        foreach([RadioService::class=>'requireValidRosterFreshness',RestStateStore::class=>'requireExistingSchema',
+            ServerOperationsClient::class=>'requireExistingSchema',GatewayRosterSession::class=>'requireExistingSchema']as$class=>$method){
+            if(!method_exists($class,$method)){$validatorsAvailable=false;}
+        }
+        if(!$validatorsAvailable){
+            // Old constructors retain strict freshness/schema validation. Keep
+            // their existing no-initialization path and buffer diagnostics.
+            $context=$this->build($config,static fn():bool=>true,null,SafeDiagnostics::fromConfig($config,null,null,true),false,self::INGRESS_BUSY_TIMEOUT_MS);
+            try{return ['queue'=>$context->queue,'handoff'=>$context->handoff];}
+            finally{$context->roster->close();}
+        }
+        RadioService::requireValidRosterFreshness($config);
+        $db=Database::openExisting($config['private_db_path'],self::INGRESS_BUSY_TIMEOUT_MS);
+        // Keep the established fail-before-enqueue storage contract without
+        // constructing REST, Gateway, service, renderer or worker objects.
+        RestStateStore::requireExistingSchema($db->pdo());
+        ServerOperationsClient::requireExistingSchema($db->pdo());
+        GatewayRosterSession::requireExistingSchema($db->pdo());
+        $queue=InteractionQueue::openExisting($db->pdo(),new TokenCipher($config['token_encryption_key_hex']));
+        return ['queue'=>$queue,'handoff'=>AckHandoff::openExisting($config)];
+    }
+    public function build(#[\SensitiveParameter] array $config,\Closure $outerGuard,?float $deadline=null,?SafeDiagnostics $diagnostics=null,bool $initializeStorage=true,int $busyTimeoutMs=self::WORKER_BUSY_TIMEOUT_MS):OperationsContext
     {
         if(!OperationsConfig::ready($config)){throw new \RuntimeException('operations_configuration_unavailable');}
         $diagnostics??=SafeDiagnostics::fromConfig($config);
-        $db=new Database($config['private_db_path'],200);$http=$this->http??new CurlHttpAdapter();$session=null;
+        $db=$initializeStorage?new Database($config['private_db_path'],$busyTimeoutMs):Database::openExisting($config['private_db_path'],$busyTimeoutMs);
+        $http=$this->http??new CurlHttpAdapter();$session=null;
         $guard=static function()use($outerGuard,&$session):bool{
             if($outerGuard()!==true){return false;}if($session?->active()){$session->pump();}return true;
         };
         // Capture the session by reference, not its initial null value.
         $sourceGuard=static function(string $user,?MemberActionFence $fence)use(&$session):bool{return $fence!==null&&$fence->userId===$user&&$session?->matches($fence)===true;};
-        $client=new ServerOperationsClient($db,$http,$config['bot_token'],[
+        $clientOptions=[
             'enabled'=>true,'posts_enabled'=>$config['posts_enabled'],'roles_enabled'=>$config['roles_enabled'],
-            'room_permissions_enabled'=>$config['room_permissions_enabled'],'room_baseline'=>$config['room_baseline'],
+            'room_permissions_enabled'=>$config['room_permissions_enabled'],'room_baseline'=>$config['room_baseline']??null,
+            'room_access_mode'=>$config['room_access_mode']??'time_gated',
             'commands_enabled'=>$config['command_registration_enabled'],'participant_scope'=>ParticipantScope::mode($config),'member_actions_enabled'=>$config['member_actions_enabled'],
             'accept_voice_race_risk'=>$config['accept_voice_race_risk'],'role_ids'=>$config['role_ids'],'owner_user_id'=>$config['owner_user_id']??null,'request_guard'=>$guard,'source_guard'=>$sourceGuard,'diagnostics'=>$diagnostics,
-            'weekly_ranking_enabled'=>$config['weekly_ranking_enabled']??false,'weekly_ranking_now'=>fn():int=>$this->clock->now()->getTimestamp()]);
-        $session=new GatewayRosterSession($db,$client,$this->clock,$config['bot_token'],$this->transportFactory??static fn()=>new TlsGatewayTransport(),$outerGuard);
+            'weekly_ranking_enabled'=>$config['weekly_ranking_enabled']??false,'weekly_ranking_now'=>fn():int=>$this->clock->now()->getTimestamp()];
+        $client=$initializeStorage?new ServerOperationsClient($db,$http,$config['bot_token'],$clientOptions)
+            :ServerOperationsClient::openExisting($db,$http,$config['bot_token'],$clientOptions);
+        $transport=$this->transportFactory??static fn()=>new TlsGatewayTransport();
+        $session=$initializeStorage?new GatewayRosterSession($db,$client,$this->clock,$config['bot_token'],$transport,$outerGuard)
+            :GatewayRosterSession::openExisting($db,$client,$this->clock,$config['bot_token'],$transport,$outerGuard);
         $gateway=new ServerOperationsGateway($client,$this->clock,$config,$session,$diagnostics);$service=new RadioService($db,$gateway,$this->clock,$config);
-        $queue=new InteractionQueue($db->pdo(),new TokenCipher($config['token_encryption_key_hex']));
-        $queue->initializeAcknowledgements();$handoff=new AckHandoff($config);
+        if($initializeStorage){
+            $queue=new InteractionQueue($db->pdo(),new TokenCipher($config['token_encryption_key_hex']));
+            $queue->initializeAcknowledgements();$handoff=new AckHandoff($config);
+        }else{
+            $queue=InteractionQueue::openExisting($db->pdo(),new TokenCipher($config['token_encryption_key_hex']));
+            $handoff=AckHandoff::openExisting($config);
+        }
         $options=['enabled'=>true];if($deadline!==null){$options['deadline_monotonic']=$deadline;}
+        if(!$initializeStorage){$options['state_store']=RestStateStore::openExisting($db->pdo());}
         $followup=new DiscordRestFollowupSink(new DiscordRestClient($http,DiscordRestClient::APPLICATION_ID,$config['bot_token'],$options),$diagnostics);
         $preflight=static function()use($client):array{$ok=$client->identity()->ok;return ['ok'=>$ok,'code'=>$ok?'operations_identity_verified':'validation_bot_identity_unverified'];};
         $worker=new InteractionWorker($queue,$service,static fn()=>new CardRenderer($config['font_candidates']),$followup,$this->clock,null,'operations',$preflight,$diagnostics);
@@ -46,9 +95,12 @@ final class OperationsRuntime
     {
         if(!$handoff->recordFinished($ticket,$this->clock->now()->getTimestamp())){return ['ok'=>false,'code'=>'interaction_expired'];}
         $diagnostics?->record('ack_handoff',['ok'=>true,'code'=>'ack_handoff_saved']);
+        // Preserve ingress/ACK evidence before any potentially slow worker, but only
+        // after the durable ACK proof exists. This never adds I/O before the response.
+        if($diagnostics!==null&&method_exists($diagnostics,'checkpoint')){$diagnostics->checkpoint();}
         $end=hrtime(true)/1e9+10;$context=null;
         try{
-            $context=$this->build($config,static fn():bool=>hrtime(true)/1e9<$end,$end,$diagnostics);
+            $context=$this->build($config,static fn():bool=>hrtime(true)/1e9<$end,$end,$diagnostics,false);
             $context->queue->expire($this->clock->now()->getTimestamp());$recovery=$handoff->recover($context->queue,$this->clock->now()->getTimestamp());
             if($recovery['recovered']>0){$diagnostics?->record('ack_handoff',['ok'=>true,'code'=>'ack_handoff_recovered','count'=>$recovery['recovered']]);}
             if(!$context->queue->acknowledged($id)){$diagnostics?->record('ack_handoff',['ok'=>false,'code'=>'ack_handoff_pending']);return ['ok'=>false,'code'=>'ack_handoff_pending'];}
@@ -91,3 +143,4 @@ final class OperationsRuntime
         return $context->db->pdo()->query("SELECT 1 FROM interaction_jobs j JOIN operations_ack_receipts a ON a.interaction_id=j.interaction_id WHERE j.scope_mode='operations' AND j.state IN ('pending','processing') LIMIT 1")->fetchColumn()!==false;
     }
 }
+

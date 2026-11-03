@@ -9,17 +9,25 @@ final class Database
     private PDO $connection;
     private bool $writing = false;
 
-    public function __construct(string $path, int $busyTimeoutMs = 5000,bool $initialize=true)
+    public static function openExisting(string $path,int $busyTimeoutMs=5000):self
+    {
+        $database=new self($path,$busyTimeoutMs,false,true);$database->requireCoreSchema();return $database;
+    }
+
+    public function __construct(string $path, int $busyTimeoutMs = 5000,bool $initialize=true,bool $existingOnly=false)
     {
         if ($path === '') { throw new \InvalidArgumentException('An application database is required.'); }
         if ($busyTimeoutMs < 0 || $busyTimeoutMs > 5000) { throw new \InvalidArgumentException('Busy timeout must be between zero and five seconds.'); }
+        if($existingOnly&&($path===':memory:'||is_link($path)||!is_file($path))){throw new \RuntimeException('The existing application database is unavailable.');}
         if ($path !== ':memory:') {
             $directory = dirname($path);
-            if (!is_dir($directory) && !mkdir($directory, 0700, true) && !is_dir($directory)) {
+            if (!$existingOnly&&!is_dir($directory) && !mkdir($directory, 0700, true) && !is_dir($directory)) {
                 throw new \RuntimeException('Cannot prepare the private application database.');
             }
         }
-        $this->connection = new PDO('sqlite:' . $path, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]);
+        $options=[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC];
+        if($existingOnly){$options[PDO::SQLITE_ATTR_OPEN_FLAGS]=PDO::SQLITE_OPEN_READWRITE;}
+        $this->connection = new PDO('sqlite:' . $path, null, null, $options);
         $this->connection->exec('PRAGMA busy_timeout = ' . $busyTimeoutMs);
         $this->connection->exec('PRAGMA foreign_keys = ON');
         if(!$initialize){return;}
@@ -113,6 +121,52 @@ SQL);
     }
 
     public function pdo(): PDO { return $this->connection; }
+
+    /** Structural validation only: no CREATE, ALTER, journal change, or seed write. */
+    public static function requireTable(PDO $pdo,string $table,array $expected):void
+    {
+        if(preg_match('/\A[a-z_][a-z0-9_]*\z/D',$table)!==1||$expected===[]){throw new \RuntimeException('private_schema_unavailable');}
+        $type=$pdo->prepare('SELECT type FROM sqlite_master WHERE name=?');$type->execute([$table]);
+        if($type->fetchColumn()!=='table'){throw new \RuntimeException('private_schema_unavailable');}
+        $rows=$pdo->query('PRAGMA table_info('.$table.')')->fetchAll(PDO::FETCH_ASSOC);$columns=[];$primary=[];
+        foreach($rows as$row){$columns[$row['name']]=$row;if((int)$row['pk']>0){$primary[(int)$row['pk']]=$row['name'];}}
+        ksort($primary);$primary=array_values($primary);
+        foreach($expected as$name=>$contract){
+            $row=$columns[$name]??null;
+            if(!is_array($row)||strtoupper((string)$row['type'])!==$contract[0]||(int)$row['notnull']!==$contract[1]
+                ||self::schemaDefault($row['dflt_value'])!==$contract[2]||(int)$row['pk']!==$contract[3]){throw new \RuntimeException('private_schema_unavailable');}
+        }
+        $requiredPrimary=[];foreach($expected as$name=>$contract){if($contract[3]>0){$requiredPrimary[$contract[3]]=$name;}}ksort($requiredPrimary);
+        if($primary!==array_values($requiredPrimary)){throw new \RuntimeException('private_schema_unavailable');}
+    }
+
+    private static function schemaDefault(mixed $value):?string
+    {
+        if($value===null){return null;}$value=trim((string)$value);
+        while(strlen($value)>1&&$value[0]==='('&&$value[strlen($value)-1]===')'){$value=trim(substr($value,1,-1));}
+        if(strlen($value)>1&&(($value[0]==="'"&&$value[strlen($value)-1]==="'")||($value[0]==='"'&&$value[strlen($value)-1]==='"'))){$value=substr($value,1,-1);}
+        return $value;
+    }
+
+    private function requireCoreSchema():void
+    {
+        $n=static fn(string $type,int $notNull=0,?string $default=null,int $primary=0):array=>[$type,$notNull,$default,$primary];
+        $contracts=[
+            'sessions'=>['id'=>$n('TEXT',0,null,1),'scheduled_at'=>$n('INTEGER',1),'count_date'=>$n('TEXT',1),'opens_at'=>$n('INTEGER',1),'unstarted_closes_at'=>$n('INTEGER',1),'status'=>$n('TEXT',1),'started_at'=>$n('INTEGER'),'started_by'=>$n('TEXT'),'closes_at'=>$n('INTEGER'),'warning_sent_at'=>$n('INTEGER'),'closed_at'=>$n('INTEGER'),'slot_id'=>$n('TEXT'),'stamp'=>$n('TEXT')],
+            'participants'=>['user_id'=>$n('TEXT',0,null,1),'total_count'=>$n('INTEGER',1,'0'),'latest_threshold'=>$n('INTEGER'),'latest_title'=>$n('TEXT')],
+            'attendance'=>['session_id'=>$n('TEXT',1,null,1),'user_id'=>$n('TEXT',1,null,2),'count_date'=>$n('TEXT',1),'attended_at'=>$n('INTEGER',1),'ordinal'=>$n('INTEGER',1),'stamp'=>$n('TEXT',1)],
+            'memorial_awards'=>['user_id'=>$n('TEXT',1,null,1),'milestone'=>$n('INTEGER',1,null,2),'reached_at'=>$n('INTEGER',1)],
+            'core_interactions'=>['id'=>$n('TEXT',0,null,1),'operation'=>$n('TEXT',1),'session_id'=>$n('TEXT',1),'user_id'=>$n('TEXT',1),'result_json'=>$n('TEXT',1),'created_at'=>$n('INTEGER',1)],
+            'achievement_notices'=>['user_id'=>$n('TEXT',1,null,1),'threshold'=>$n('INTEGER',1,null,2),'total_count'=>$n('INTEGER',1),'status'=>$n('TEXT',1),'created_at'=>$n('INTEGER',1),'attempted_at'=>$n('INTEGER'),'sent_at'=>$n('INTEGER'),'claim_owner'=>$n('TEXT'),'attempts'=>$n('INTEGER',1,'0'),'retry_stopped_at'=>$n('INTEGER')],
+            'day_achievement_notices'=>['user_id'=>$n('TEXT',1,null,1),'milestone'=>$n('INTEGER',1,null,2),'total_days'=>$n('INTEGER',1),'owner_user_id'=>$n('TEXT'),'status'=>$n('TEXT',1),'created_at'=>$n('INTEGER',1),'attempted_at'=>$n('INTEGER'),'sent_at'=>$n('INTEGER'),'claim_owner'=>$n('TEXT'),'attempts'=>$n('INTEGER',1,'0')],
+            'receipt_announcements'=>['session_id'=>$n('TEXT',0,null,1),'status'=>$n('TEXT',1),'created_at'=>$n('INTEGER',1),'attempted_at'=>$n('INTEGER'),'sent_at'=>$n('INTEGER'),'claim_owner'=>$n('TEXT'),'expired_at'=>$n('INTEGER')],
+            'core_effects'=>['effect_key'=>$n('TEXT',0,null,1),'kind'=>$n('TEXT',1),'payload_json'=>$n('TEXT',1),'status'=>$n('TEXT',1),'attempts'=>$n('INTEGER',1,'0'),'last_attempt_at'=>$n('INTEGER'),'completed_at'=>$n('INTEGER'),'lease_until'=>$n('INTEGER',1,'0'),'lease_owner'=>$n('TEXT'),'expires_at'=>$n('INTEGER'),'cancelled_at'=>$n('INTEGER')],
+            'weekly_ranking_weeks'=>['week_key'=>$n('TEXT',0,null,1),'guild_id'=>$n('TEXT',1),'week_start'=>$n('INTEGER',1),'week_end'=>$n('INTEGER',1),'eligible_at'=>$n('INTEGER',1),'expires_at'=>$n('INTEGER',1),'channel_id'=>$n('TEXT',1),'snapshot_json'=>$n('TEXT',1),'part_count'=>$n('INTEGER',1),'status'=>$n('TEXT',1),'created_at'=>$n('INTEGER',1)],
+            'weekly_ranking_parts'=>['part_key'=>$n('TEXT',0,null,1),'week_key'=>$n('TEXT',1),'part_no'=>$n('INTEGER',1),'payload_json'=>$n('TEXT',1),'status'=>$n('TEXT',1),'attempts'=>$n('INTEGER',1,'0'),'available_at'=>$n('INTEGER',1,'0'),'claim_owner'=>$n('TEXT'),'attempted_at'=>$n('INTEGER'),'sent_at'=>$n('INTEGER'),'message_id'=>$n('TEXT'),'outcome'=>$n('TEXT')],
+        ];
+        foreach($contracts as$table=>$columns){self::requireTable($this->connection,$table,$columns);}
+        foreach(['attendance_month','attendance_jst_days','sessions_logical_slot_day']as$index){$q=$this->connection->prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=? AND sql IS NOT NULL");$q->execute([$index]);if($q->fetchColumn()===false){throw new \RuntimeException('private_schema_unavailable');}}
+    }
 
     public function inTransaction(): bool { return $this->writing || $this->connection->inTransaction(); }
 

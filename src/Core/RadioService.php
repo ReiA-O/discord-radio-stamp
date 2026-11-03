@@ -30,6 +30,15 @@ final class RadioService
     private bool $adminValidationMode = false;
     private bool $operationsMode = false;
 
+    /** Shared pure guard: an absent value defaults to five; explicit null is invalid. */
+    public static function requireValidRosterFreshness(#[\SensitiveParameter] array $config):void
+    {
+        $maxAge=array_key_exists('max_roster_age_seconds',$config)?$config['max_roster_age_seconds']:5;
+        if(!is_int($maxAge)||$maxAge<0||$maxAge>5){
+            throw new \InvalidArgumentException('Voice observation freshness must be at most five seconds.');
+        }
+    }
+
     public function __construct(private Database $db, private Gateway $discord, private Clock $clock, array $config)
     {
         $this->config = $config + [
@@ -71,9 +80,7 @@ final class RadioService
             || !$discord->permitsValidationUser($this->config['guild_id'], $this->config['admin_user_ids'][0]))) {
             throw new \LogicException('The administrator validation scope does not match its fixed transport.');
         }
-        if (!is_int($this->config['max_roster_age_seconds']) || $this->config['max_roster_age_seconds'] < 0 || $this->config['max_roster_age_seconds'] > 5) {
-            throw new \InvalidArgumentException('Voice observation freshness must be at most five seconds.');
-        }
+        self::requireValidRosterFreshness($this->config);
         $this->timezone = new DateTimeZone('Asia/Tokyo');
         $this->schedule = Schedule::fromConfig($config);
         $this->config['warning_channel_id'] ??= $this->config['voice_channel_id'];
@@ -246,12 +253,20 @@ final class RadioService
     {
         $owner=bin2hex(random_bytes(16));
         $state=$this->db->transaction(function(PDO $pdo)use($id,$owner):array {
-            $q=$pdo->prepare('SELECT r.status,r.expired_at,s.closes_at FROM receipt_announcements r JOIN sessions s ON s.id=r.session_id WHERE r.session_id=?');$q->execute([$id]);$row=$q->fetch();
+            $q=$pdo->prepare('SELECT r.status,r.expired_at,s.closes_at,s.scheduled_at FROM receipt_announcements r JOIN sessions s ON s.id=r.session_id WHERE r.session_id=?');$q->execute([$id]);$row=$q->fetch();
             if($row!==false&&$row['expired_at']!==null){return ['status'=>'expired'];}
-            if ($row===false || $row['status']!=='pending') { return $row===false ? ['status'=>'missing'] : $row; }
-            if ($this->now()>=(int)$row['closes_at']) {
-                $pdo->prepare("UPDATE receipt_announcements SET expired_at=? WHERE session_id=? AND status='pending' AND expired_at IS NULL")->execute([$this->now(),$id]);return ['status'=>'expired'];
+            if($row!==false&&$this->now()>=(int)$row['closes_at']&&in_array($row['status'],['pending','uncertain'],true)){
+                $expire=$row['status']==='pending';
+                if(!$expire){
+                    $newer=$pdo->prepare('SELECT 1 FROM sessions WHERE scheduled_at>? AND opens_at<=? LIMIT 1');
+                    $newer->execute([$row['scheduled_at'],$this->now()]);$expire=$newer->fetchColumn()!==false;
+                }
+                if($expire){
+                    $pdo->prepare('UPDATE receipt_announcements SET expired_at=? WHERE session_id=? AND status=? AND expired_at IS NULL')
+                        ->execute([$this->now(),$id,$row['status']]);return ['status'=>'expired'];
+                }
             }
+            if ($row===false || $row['status']!=='pending') { return $row===false ? ['status'=>'missing'] : $row; }
             $session=$this->session($pdo,$id);
             if($session===null||$this->sessionBindingError($session)!==null){return ['status'=>'binding_unavailable'];}
             if ($this->sessionScheduleConflict($pdo,$session,$this->now())) { return ['status'=>'conflict']; }
@@ -438,6 +453,11 @@ final class RadioService
                 :($this->config['participant_commands_enabled']
                     ?'閉場まであと1分です。続けて話す方は牧歌的温泉街へ自分で移動してください。閉場時に残っている方は参加登録の有無にかかわらず切断します。'
                     :'閉場まであと1分です。参加登録者は牧歌的温泉街へ移動し、未登録者は切断されます。移動に失敗した方を切断することはありません。');
+            if($this->alwaysOpenRoom()){
+                $warning='この回はあと1分で終了です。続けて話す方は牧歌的温泉街へ自分で移動してください。'
+                    .($this->config['closure_policy']==='manual'?'残留者の切断は管理者が確認します。':'終了時に残っている方は参加登録の有無にかかわらず切断します。')
+                    .'VCは常時利用できるため、再入室はできます。';
+            }
             $sent = $this->dispatch($warningKey, fn(string $key) =>
                 $this->discord->sendMessage($this->config['warning_channel_id'], $warning, $key));
             if (!$sent) { return $this->result(false, 'warning_pending', ['session_id' => $id]); }
@@ -472,8 +492,10 @@ final class RadioService
         if (!$closing) { return $this->result(true, 'closure_rescheduled', ['session_id' => $id]); }
         if ($this->config['member_actions_enabled'] !== true) {
             if($this->operationsMode&&$this->config['closure_policy']==='manual'){
-                $key='close-room:'.$id;$this->enqueue($key,'room_close',['session_id'=>$id]);
-                if(!$this->dispatch($key,fn(string $operation)=>$this->discord->setRoomOpen($this->config['voice_channel_id'],false,$operation))){return $this->result(false,'room_close_pending',['session_id'=>$id]);}
+                if(!$this->alwaysOpenRoom()){
+                    $key='close-room:'.$id;$this->enqueue($key,'room_close',['session_id'=>$id]);
+                    if(!$this->dispatch($key,fn(string $operation)=>$this->discord->setRoomOpen($this->config['voice_channel_id'],false,$operation))){return $this->result(false,'room_close_pending',['session_id'=>$id]);}
+                }
                 $this->db->transaction(fn(PDO $pdo)=>$pdo->prepare("UPDATE sessions SET status='closed',closed_at=? WHERE id=?")->execute([$this->now(),$id]));
                 return $this->result(true,'manual_member_actions_required',['session_id'=>$id]);
             }
@@ -488,12 +510,27 @@ final class RadioService
         if (!is_string($destination) || $destination === '' || $destination === $this->config['voice_channel_id']) {
             return $this->result(false, 'destination_unverified', ['session_id' => $id]);
         }
+        $closureOwner=null;
+        if($this->alwaysOpenRoom()){
+            // This permanent claim bounds closure to one pass, including after a crash.
+            $closureOwner=bin2hex(random_bytes(16));
+            $claimed=$this->db->transaction(function(PDO $pdo)use($id,$closureOwner):bool{
+                $q=$pdo->prepare("INSERT OR IGNORE INTO core_effects(effect_key,kind,payload_json,status,lease_owner,attempts,last_attempt_at) VALUES(?,?,?,'pending',?,1,?)");
+                $q->execute(['closure-once:'.$id,'closure_once',json_encode(['session_id'=>$id],JSON_THROW_ON_ERROR),$closureOwner,$this->now()]);
+                return $q->rowCount()===1;
+            });
+            if(!$claimed){return $this->finishAlwaysOpenClosure($id,null,[],true);}
+        }
         $roster = $this->discord->roster($this->config['guild_id'], $this->config['voice_channel_id']);
         $rosterError = $this->rosterError($roster);
-        if ($rosterError !== null) { return $this->result(false, $rosterError, ['session_id' => $id]); }
-        $this->enqueue('close-room:' . $id, 'room_close', ['session_id' => $id]);
-        if (!$this->dispatch('close-room:' . $id, fn(string $key) => $this->discord->setRoomOpen($this->config['voice_channel_id'], false, $key))) {
-            return $this->result(false, 'room_close_pending', ['session_id' => $id]);
+        if ($rosterError !== null) {
+            return $this->alwaysOpenRoom()?$this->finishAlwaysOpenClosure($id,$closureOwner,[],true):$this->result(false, $rosterError, ['session_id' => $id]);
+        }
+        if(!$this->alwaysOpenRoom()){
+            $this->enqueue('close-room:' . $id, 'room_close', ['session_id' => $id]);
+            if (!$this->dispatch('close-room:' . $id, fn(string $key) => $this->discord->setRoomOpen($this->config['voice_channel_id'], false, $key))) {
+                return $this->result(false, 'room_close_pending', ['session_id' => $id]);
+            }
         }
         $members = array_values(array_unique(array_map('strval', $roster->memberIds)));
         $pending = [];
@@ -519,7 +556,8 @@ final class RadioService
                 if (!$ok) { $pending[$userId] = 'disconnect_pending'; }
             }
         }
-        // Recheck completeness. Newly arrived, re-entered, or unknown members keep closure pending.
+        if($this->alwaysOpenRoom()){return $this->finishAlwaysOpenClosure($id,$closureOwner,$pending);}
+        // The time-gated model keeps the gate shut while retrying the remaining members.
         $remaining = $this->discord->roster($this->config['guild_id'], $this->config['voice_channel_id']);
         $remainingError = $this->rosterError($remaining);
         if ($remainingError !== null) { return $this->result(false, $remainingError, ['session_id' => $id]); }
@@ -530,6 +568,20 @@ final class RadioService
         if ($pending !== []) { return $this->result(false, 'closure_pending', ['session_id' => $id, 'pending' => $pending]); }
         $this->db->transaction(fn(PDO $pdo) => $pdo->prepare("UPDATE sessions SET status='closed',closed_at=? WHERE id=?")->execute([$this->now(), $id]));
         return $this->result(true, 'closed', ['session_id' => $id]);
+    }
+
+    /** A pass is complete even when a guarded disconnect needs manual follow-up. Never sweep later arrivals. */
+    private function finishAlwaysOpenClosure(string $id,?string $owner,array $pending=[],bool $unconfirmed=false):array
+    {
+        $this->db->transaction(function(PDO $pdo)use($id,$owner):void{
+            $pdo->prepare("UPDATE sessions SET status='closed',closed_at=? WHERE id=?")->execute([$this->now(),$id]);
+            if($owner!==null){
+                $pdo->prepare("UPDATE core_effects SET status='done',completed_at=?,lease_owner=NULL WHERE effect_key=? AND kind='closure_once' AND status='pending' AND lease_owner=?")
+                    ->execute([$this->now(),'closure-once:'.$id,$owner]);
+            }
+        });
+        $confirmed=!$unconfirmed&&$pending===[];
+        return $this->result($confirmed,$confirmed?'closed':'manual_member_actions_required',['session_id'=>$id,'pending'=>$pending]);
     }
 
     /** An announcement that never applied must not trigger unannounced member actions. Close only the gate. */
@@ -550,8 +602,10 @@ final class RadioService
             if(in_array($state,['slot_binding_required','session_slot_binding_conflict'],true)){return $this->result(false,$state,['session_id'=>$id]);}
             return $this->result($state!=='conflict',$state==='conflict'?'session_schedule_conflict':($state==='superseded'?'receipt_expired_superseded':'closed'),['session_id'=>$id]);
         }
-        $key='close-room:'.$id;$this->enqueue($key,'room_close',['session_id'=>$id]);
-        if(!$this->dispatch($key,fn(string $operation):bool=>$this->discord->setRoomOpen($this->config['voice_channel_id'],false,$operation))){return $this->result(false,'receipt_expired_room_close_pending',['session_id'=>$id]);}
+        if(!$this->alwaysOpenRoom()){
+            $key='close-room:'.$id;$this->enqueue($key,'room_close',['session_id'=>$id]);
+            if(!$this->dispatch($key,fn(string $operation):bool=>$this->discord->setRoomOpen($this->config['voice_channel_id'],false,$operation))){return $this->result(false,'receipt_expired_room_close_pending',['session_id'=>$id]);}
+        }
         $this->db->transaction(fn(PDO $pdo)=>$pdo->prepare("UPDATE sessions SET status='closed',closed_at=? WHERE id=?")->execute([$this->now(),$id]));
         return $this->result(true,'receipt_expired_closed',['session_id'=>$id]);
     }
@@ -591,12 +645,14 @@ final class RadioService
         return $query->fetchColumn()!==false;
     }
 
+    private function alwaysOpenRoom():bool{return $this->operationsMode&&OperationsConfig::alwaysOpen($this->config);}
+
     private function ensureOpen(PDO $pdo, array $session): bool
     {
         // Do not reopen an already closing room while retrying a failed member action.
         if ($session['status'] === 'closing') { return true; }
         $id = $session['id'];
-        $this->enqueueEffect($pdo, 'open-room:' . $id, 'room_open', ['session_id' => $id]);
+        if(!$this->alwaysOpenRoom()){$this->enqueueEffect($pdo, 'open-room:' . $id, 'room_open', ['session_id' => $id]);}
         $this->enqueueEffect($pdo, 'guide:' . $id, 'guide', ['session_id' => $id]);
         if($this->operationsMode){
             $this->enqueueEffect($pdo,OpeningNoticeMessage::key($id),'opening_notice',OpeningNoticeMessage::snapshot($session),(int)$session['scheduled_at']);
@@ -617,14 +673,17 @@ final class RadioService
             $content = "あと30分でラジオ体操だよー！⚡\n予定時刻: " . $scheduled->format('Y-m-d H:i') . ' JST';
             $reminder = $this->dispatch('reminder:' . $id, fn(string $key) => $this->discord->sendMessage($this->config['text_channel_id'], $content, $key));
         }
-        $opened = $this->dispatch('open-room:' . $id, fn(string $key) => $this->discord->setRoomOpen($this->config['voice_channel_id'], true, $key));
+        $opened = $this->alwaysOpenRoom()
+            ? $this->discord instanceof OpeningNoticeGateway&&$this->discord->openingRoomVerified()
+            : $this->dispatch('open-room:' . $id, fn(string $key) => $this->discord->setRoomOpen($this->config['voice_channel_id'], true, $key));
         if (!$opened) { return false; }
         // Notification failure/hold must not prevent the existing VC guide or participant flow.
         if($this->operationsMode){$this->flushOpeningNotice($id);}
         if ($this->config['participant_commands_enabled']) {
             if ($session['started_at'] !== null) { return $reminder; }
+            $intro=$this->alwaysOpenRoom()?'この回の体操案内です。':'会場を開きました。';
             $guide=$this->dispatch('guide:'.$id,fn(string $key)=>$this->discord->sendMessage($this->config['voice_channel_id'],
-                "会場を開きました。Watch Togetherで動画を手動再生して、第1・第2を1セットで体操してください。\n体操後に在室中の誰か1人が /radio-attend を実行すると、共有の参加受付を10分間開きます。全員が自分で参加ボタンを押してください。\nhttps://www.youtube.com/watch?v=RNlB93CuwOI",$key));
+                $intro."Watch Togetherで動画を手動再生して、第1・第2を1セットで体操してください。\n体操後に在室中の誰か1人が /radio-attend を実行すると、共有の参加受付を10分間開きます。全員が自分で参加ボタンを押してください。\nhttps://www.youtube.com/watch?v=RNlB93CuwOI",$key));
             return $guide && $reminder;
         }
         // The attached VC chat uses voice_channel_id; the text reminder above is separate.
@@ -655,7 +714,9 @@ final class RadioService
                     ||(int)$effect['expires_at']!==(int)$session['scheduled_at']){return null;}
                 $snapshot=OpeningNoticeMessage::snapshot($session);
                 if(json_decode($effect['payload_json'],true,32,JSON_THROW_ON_ERROR)!==$snapshot){return null;}
-                $q=$pdo->prepare("SELECT 1 FROM core_effects WHERE effect_key=? AND kind='room_open' AND status='done' AND cancelled_at IS NULL");$q->execute(['open-room:'.$id]);$opened=$q->fetchColumn()!==false;$q->closeCursor();if(!$opened){return null;}
+                if(!$this->alwaysOpenRoom()){
+                    $q=$pdo->prepare("SELECT 1 FROM core_effects WHERE effect_key=? AND kind='room_open' AND status='done' AND cancelled_at IS NULL");$q->execute(['open-room:'.$id]);$opened=$q->fetchColumn()!==false;$q->closeCursor();if(!$opened){return null;}
+                }
                 // A previous-version reminder might already have arrived. Preserve it; do not add another message.
                 $q=$pdo->prepare('SELECT status,attempts,last_attempt_at FROM core_effects WHERE effect_key=?');$q->execute(['reminder:'.$id]);$legacy=$q->fetch();$q->closeCursor();
                 if($legacy!==false&&($legacy['status']==='done'||(int)$legacy['attempts']>0||$legacy['last_attempt_at']!==null)){

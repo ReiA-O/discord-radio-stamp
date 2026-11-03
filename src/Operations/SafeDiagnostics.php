@@ -5,6 +5,9 @@ namespace RadioStamp\Operations;
 /** Explicit opt-in, private JSONL. Arbitrary strings and exception messages never cross this boundary. */
 final class SafeDiagnostics
 {
+    private const BUFFER_MAX_EVENTS=32;
+    private const BUFFER_MAX_BYTES=32768;
+    private const BUFFER_SUMMARY_RESERVE=64;
     private const STAGES=['http_prepare','http_controller','http_action','http_queue','ack_emit','ack_finish','after_response',
         'worker_claim','worker_result','followup','cycle','session','member_pending','rest','rest_exception','roster','member_guard','ack_handoff','weekly_ranking'];
     private const ACTIONS=['receipt','attend','card','status','start','memorial','check'];
@@ -49,16 +52,21 @@ final class SafeDiagnostics
     private int $started;
     private int $dropped=0;
     private array $dynamicAliases=[];
-    private function __construct(private readonly bool $enabled,private readonly ?\Closure $writer,private readonly array $participants=[],?int $started=null,private readonly bool $guildScope=false)
+    private array $buffer=[];
+    private int $bufferBytes=0;
+    private int $bufferDropped=0;
+    private bool $bufferResolved=false;
+    private bool $discarded=false;
+    private function __construct(private readonly bool $enabled,private readonly ?\Closure $writer,private readonly array $participants=[],?int $started=null,private readonly bool $guildScope=false,private bool $buffering=false)
     {
         $this->started=$started??hrtime(true);
     }
-    public static function fromConfig(array $config,?\Closure $writer=null,?int $started=null):self
+    public static function fromConfig(array $config,?\Closure $writer=null,?int $started=null,bool $buffered=false):self
     {
         if(($config['diagnostics_enabled']??false)!==true){return new self(false,null);}
         $participants=array_values(array_filter($config['participant_user_ids']??[],static fn($id)=>is_string($id)&&preg_match('/\A[1-9][0-9]{16,19}\z/D',$id)===1));
         $guildScope=ParticipantScope::mode($config)==='guild';
-        if($writer!==null){return new self(true,$writer,$participants,$started,$guildScope);}
+        if($writer!==null){return new self(true,$writer,$participants,$started,$guildScope,$buffered);}
         $root=$config['private_root']??null;
         if(!is_string($root)||!is_dir($root)||is_link($root)||($real=realpath($root))===false){return new self(false,null);}
         $path=$real.DIRECTORY_SEPARATOR.'operations-diagnostic.safe.jsonl';
@@ -69,11 +77,16 @@ final class SafeDiagnostics
             try{
                 $handle=@fopen($path,'ab');
                 if($handle===false){return false;}
-                try{if(!@flock($handle,LOCK_EX|LOCK_NB)){return false;}@chmod($path,0600);$written=@fwrite($handle,$line);@flock($handle,LOCK_UN);return $written===strlen($line);}
+                try{
+                    if(!@flock($handle,LOCK_EX|LOCK_NB)){return false;}
+                    @chmod($path,0600);$length=strlen($line);$offset=0;
+                    while($offset<$length){$written=@fwrite($handle,substr($line,$offset));if($written===false||$written===0){return false;}$offset+=$written;}
+                    @flock($handle,LOCK_UN);return true;
+                }
                 finally{@fclose($handle);}
             }finally{umask($mask);}
         };
-        return new self(true,$writer,$participants,$started,$guildScope);
+        return new self(true,$writer,$participants,$started,$guildScope,$buffered);
     }
     public static function code(mixed $code):string{return is_string($code)&&in_array($code,self::CODES,true)?$code:'other_code';}
     public static function route(string $route):string
@@ -99,7 +112,7 @@ final class SafeDiagnostics
     }
     public function record(string $stage,array $fields=[]):void
     {
-        if(!$this->enabled||$this->writer===null||!in_array($stage,self::STAGES,true)){return;}
+        if($this->discarded||!$this->enabled||$this->writer===null||!in_array($stage,self::STAGES,true)){return;}
         try{
             $event=['at_utc'=>gmdate('Y-m-d\TH:i:s\Z'),'stage'=>$stage,'elapsed_ms'=>(int)((hrtime(true)-$this->started)/1000000)];
             if($this->dropped>0){$event['dropped_events']=$this->dropped;}
@@ -112,10 +125,52 @@ final class SafeDiagnostics
             if(in_array($fields['route']??null,self::ROUTES,true)){$event['route']=$fields['route'];}
             if(is_string($fields['actor']??null)&&preg_match('/\A(?:p(?:[1-9]|1[0-9]|20)|u[1-9][0-9]{0,5}|outside)\z/D',$fields['actor'])===1){$event['actor']=$fields['actor'];}
             if(in_array($fields['exception']??null,['PDOException','JsonException','InvalidArgumentException','TypeError','Error','RuntimeException','OtherThrowable'],true)){$event['exception']=$fields['exception'];}
-            $written=($this->writer)(json_encode($event,JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR)."\n");
-            $this->dropped=$written===false?$this->dropped+1:0;
+            $line=json_encode($event,JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR)."\n";
+            if($this->buffering){
+                if(count($this->buffer)>=self::BUFFER_MAX_EVENTS||$this->bufferBytes+strlen($line)>self::BUFFER_MAX_BYTES-self::BUFFER_SUMMARY_RESERVE){$this->bufferDropped++;return;}
+                $this->buffer[]=$line;$this->bufferBytes+=strlen($line);return;
+            }
+            $written=($this->writer)($line);$this->dropped=$written===false?$this->dropped+1:0;
         }catch(\Throwable){$this->dropped++;/* Diagnostics never break business processing. */}
     }
+    /**
+     * Persist the current post-response batch without ending buffering.
+     * HTTP uses this only after the durable ACK proof is saved and before worker work.
+     */
+    public function checkpoint():bool
+    {
+        if(!$this->buffering||$this->bufferResolved){return true;}
+        return $this->writeBufferedBatch();
+    }
+    /** Flush is explicit and idempotent. HTTP calls it only after response finish and callback work. */
+    public function flush():bool
+    {
+        if(!$this->buffering||$this->bufferResolved){return true;}
+        $this->bufferResolved=true;$this->buffering=false;
+        return $this->writeBufferedBatch();
+    }
+    /** Drain-before-write avoids duplicating a partially written batch on a later checkpoint. */
+    private function writeBufferedBatch():bool
+    {
+        $lines=$this->buffer;$dropped=$this->bufferDropped;
+        $this->buffer=[];$this->bufferBytes=0;$this->bufferDropped=0;
+        if(!$this->enabled||$this->writer===null||$lines===[]){return true;}
+        if($dropped>0){
+            try{
+                $last=array_key_last($lines);$event=json_decode(rtrim($lines[$last],"\n"),true,32,JSON_THROW_ON_ERROR);
+                if(is_array($event)){$event['dropped_events']=min(10000000,$dropped);$replacement=json_encode($event,JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR)."\n";
+                    $bytes=array_sum(array_map('strlen',$lines))-strlen($lines[$last])+strlen($replacement);if($bytes<=self::BUFFER_MAX_BYTES){$lines[$last]=$replacement;}}
+            }catch(\Throwable){/* A drop summary must never make the batch unsafe. */}
+        }
+        try{return ($this->writer)(implode('',$lines))!==false;}catch(\Throwable){return false;}
+    }
+    /** Drop an unconfirmed HTTP batch without performing fallback I/O. */
+    public function discard():void
+    {
+        if(!$this->buffering||$this->bufferResolved){return;}
+        $this->bufferResolved=true;$this->buffering=false;$this->discarded=true;$this->buffer=[];$this->bufferBytes=0;$this->bufferDropped=0;
+    }
+    public function buffered():bool{return $this->buffering&&!$this->bufferResolved;}
     public function exception(string $stage,\Throwable $error):void
     {
         $type=match(true){$error instanceof \PDOException=>'PDOException',$error instanceof \JsonException=>'JsonException',

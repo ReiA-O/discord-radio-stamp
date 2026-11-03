@@ -113,10 +113,11 @@ function unsentClaimLockCases():array
         $cases[$entry]=['first_outcome'=>$first->outcome->value,'mutations_before_recovery'=>0,'retry_ok'=>$retry->ok,'mutation_calls_after_recovery'=>$mutations($http)];
     }
     // The Core owner has already claimed: local completion can persist pending after the shorter lock.
+    // The worker default busy timeout (5 s) would simply outwait these holders; pin 200 ms to exercise claim failure.
     foreach(['receipt','achievement','long_receipt']as$kind){
         $folder=$root.'/'.$kind;mkdir($folder,0700);mkdir($folder.'/private',0700);$config=runtimeFixtureConfig($folder,'best_effort',true);
         $config['participant_scope']='guild';$config['participant_user_ids']=[];$config['live_automation_enabled']=true;$config['schedule']=['daily_times'=>[],'one_off_times'=>[['at'=>'2026-10-20 14:30','slot_id'=>'morning']]];
-        $clock=new FrozenClock('2026-10-20T14:30:00+09:00');$http=new RecoveryFakeHttp(new RuntimeFixtureHttp());$runtime=new OperationsRuntime($http,fn()=>$http->inner->transport(),$clock);$context=$runtime->build($config,static fn()=>true);$pdo=$context->db->pdo();$at=$clock->now()->getTimestamp();
+        $clock=new FrozenClock('2026-10-20T14:30:00+09:00');$http=new RecoveryFakeHttp(new RuntimeFixtureHttp());$runtime=new OperationsRuntime($http,fn()=>$http->inner->transport(),$clock);$context=$runtime->build($config,static fn()=>true,busyTimeoutMs:200);$pdo=$context->db->pdo();$at=$clock->now()->getTimestamp();
         if($kind==='achievement'){
             $pdo->prepare('INSERT INTO participants(user_id,total_count) VALUES(?,1)')->execute([$user]);$context->client->grantTitle($user,1);
             $pdo->prepare("INSERT INTO achievement_notices(user_id,threshold,total_count,status,created_at) VALUES(?,1,1,'pending',?)")->execute([$user,$at]);
@@ -171,7 +172,7 @@ foreach(['observation_expired','source_guard_rejected','worker_guard_exhausted',
     $options=['enabled'=>true,'member_actions_enabled'=>true,'accept_voice_race_risk'=>true,'now'=>fn():float=>$control->now,'monotonic'=>fn():float=>$http->mono,
         'request_guard'=>fn():bool=>$http->permit,'source_guard'=>fn(string $unused,?MemberActionFence $f):bool=>($case!=='source_guard_rejected'||$control->source)&&$f?->generation===$control->generation];
     $client=new ServerOperationsClient($db,$http,'fictional_unsent_token_000000',$options);
-    if($case==='local_rate_cooldown'){$db->pdo()->exec("INSERT INTO discord_rest_limits(limit_key,until_at) VALUES('route:member:voice',1001)");}
+    if($case==='local_rate_cooldown'){$db->pdo()->exec("INSERT INTO discord_rest_limits(limit_key,until_at) VALUES('v2:route:member:voice',1001)");}
     $key='disconnect:2026-10-20_1430:'.$user;$first=$client->tryRelocate($user,null,$key,new MemberActionFence(DiscordRestClient::GUILD_ID,$user,$voice,1,1000));
     $same(false,$first->ok,$case.' refuses first attempt');$same(TransportOutcome::NotStarted,$first->outcome,$case.' proves mutation transport not started');
     $same(0,$http->attempts['member']??0,$case.' no first PATCH');$same(0,(int)$db->pdo()->query('SELECT COUNT(*) FROM operation_receipts')->fetchColumn(),$case.' owned unsent claim released');
