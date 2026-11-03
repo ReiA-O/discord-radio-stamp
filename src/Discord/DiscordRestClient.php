@@ -242,7 +242,8 @@ final class DiscordRestClient
         if ($botAuth && $this->authenticationFailed) { return new RestResult(false, 'unauthorized', 401, [], 0.0, true); }
         $probes = []; $response = null;
         try {
-            $now = ($this->now)(); [$wait, $probes] = $this->store->reserve($route, $now, $major);
+            $now = ($this->now)(); // During a rolling file swap an older RestStateStore may still be loaded; fall back to its plain cooldown.
+            [$wait, $probes] = method_exists($this->store, 'reserve') ? $this->store->reserve($route, $now, $major) : [$this->store->cooldown($route, $now, $major), []];
             if ($wait > 0) { return new RestResult(false, 'rate_limited', 429, [], $wait, true); }
             if ($this->inlineOnly && $this->inlineCalls >= 1) { return new RestResult(false, 'operation_budget_exhausted'); }
             $timeout = $this->timeoutMs;

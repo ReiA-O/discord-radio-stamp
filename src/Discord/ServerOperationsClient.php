@@ -470,7 +470,7 @@ final class ServerOperationsClient
         try{
             if(($this->requestGuard)()!==true){return new RestResult(false,'operation_budget_exhausted',outcome:TransportOutcome::NotStarted);}
             if($this->authenticationFailed){return new RestResult(false,'unauthorized',401,[],0,true,TransportOutcome::NotStarted);}
-            [$wait,$probes]=$this->limits->reserve($route,($this->now)());if($wait>0){return new RestResult(false,'rate_limited',429,[],$wait,true,TransportOutcome::NotStarted);}
+            [$wait,$probes]=method_exists($this->limits,'reserve')?$this->limits->reserve($route,($this->now)()):[$this->limits->cooldown($route,($this->now)()),[]];if($wait>0){return new RestResult(false,'rate_limited',429,[],$wait,true,TransportOutcome::NotStarted);}
             $request=new HttpRequest($method,'https://discord.com/api/v10'.$path,
                 ['Authorization: Bot '.$this->botToken,'Content-Type: application/json','User-Agent: DiscordBot (https://hosting-user.example.invalid, 0.2)'],
                 $body,2000,500,65536,false,$scope,$roomScope,$noticeScope);
