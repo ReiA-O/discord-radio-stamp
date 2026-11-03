@@ -16,6 +16,8 @@ final class RestStateStore
     private const KEY_PREFIX = 'v2:';
     /** Interaction webhook endpoints are not bound by the bot's global rate limit. */
     private const INTERACTION_ROUTES = ['interaction_edit'];
+    /** An interaction token lives 15 minutes, and the shared interaction route must not stall every later reply for longer. */
+    private const MAX_INTERACTION_COOLDOWN = 900.0;
     public static function openExisting(PDO $pdo):self{return new self($pdo,false);}
 
     /** Structural preflight only; never creates tables, changes journals, or seeds state. */
@@ -57,8 +59,8 @@ final class RestStateStore
         if ($status === 429) {
             // An interaction route never writes the bot-wide global limit it is exempt from.
             $global = $global && !in_array($route, self::INTERACTION_ROUTES, true);
-            // A valid Retry-After is honoured up to a day; only non-finite input falls back to the one-hour cap.
-            $retryUntil = $this->until($now, max(0.25, $retryAfter), self::MAX_RETRY_AFTER);
+            // A valid Retry-After is honoured up to a day (interaction routes: the token lifetime); only non-finite input falls back to the one-hour cap.
+            $retryUntil = $this->until($now, max(0.25, $retryAfter), in_array($route, self::INTERACTION_ROUTES, true) ? self::MAX_INTERACTION_COOLDOWN : self::MAX_RETRY_AFTER);
             $this->putLimit($global ? 'global' : $bucket, $retryUntil, $now);
             // Route fallback protects requests before a bucket has been learned.
             $this->putLimit('route:' . $route, $retryUntil, $now);

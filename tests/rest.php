@@ -156,6 +156,8 @@ restCheck($interactionClient->botRead('guild')->code === 'rate_limited' && $inte
 restCheck($interactionStore->cooldown('interaction_edit', $limitNow) === 0.0 && $interactionClient->editOriginal($interactionId, $interactionToken, ['content' => 'x'])->ok && count($interactionHttp->requests) === 2, 'interaction_edit ignores the bot global cooldown');
 $interactionLimited = $interactionClient->editOriginal($interactionId, $interactionToken, ['content' => 'x']);
 restCheck($interactionLimited->code === 'rate_limited' && $interactionStore->cooldown('interaction_edit', $limitNow) === 60.0, 'interaction_edit 429 pauses its own route');
+$tokenStore = $limitStore(); $tokenStore->observe('interaction_edit', 'interaction_edit', [], 429, 7200.0, true, $limitNow);
+restCheck($tokenStore->cooldown('interaction_edit', $limitNow) === 900.0 && $tokenStore->cooldown('interaction_edit', $limitNow + 900.0) === 0.0 && $tokenStore->cooldown('guild', $limitNow) === 0.0, 'long interaction Retry-After is bounded by the token lifetime and never global');
 $limitNow += 30.0;
 restCheck($interactionClient->botRead('guild')->ok && count($interactionHttp->requests) === 4, 'interaction 429 marked global never writes the bot global limit');
 
