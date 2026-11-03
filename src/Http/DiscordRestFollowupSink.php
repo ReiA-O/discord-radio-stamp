@@ -3,14 +3,18 @@ declare(strict_types=1);
 namespace RadioStamp\Http;
 
 use RadioStamp\Discord\DiscordRestClient;
+use RadioStamp\Discord\RestResult;
 use RadioStamp\Operations\SafeDiagnostics;
 
 /** Only edits an existing ephemeral defer, with fixed messages and no new public post. */
-final class DiscordRestFollowupSink implements FollowupSink
+final class DiscordRestFollowupSink implements FollowupSink, FollowupOutcome
 {
+    private ?RestResult $last = null;
     public function __construct(private readonly DiscordRestClient $client,private readonly ?SafeDiagnostics $diagnostics=null) {}
+    public function lastResult(): ?RestResult { return $this->last; }
     public function send(string $interactionId, string $token, array $result, ?string $png): bool
     {
+        $this->last = null;
         $content = match ($result['code'] ?? '') {
             'started' => '体操を開始しました。参加ボタンで記録してください。',
             'attended' => '今回の参加を記録しました。',
@@ -68,7 +72,7 @@ final class DiscordRestFollowupSink implements FollowupSink
             $content .= "\n保存先検査：" . match ($result['runtime_status']) { 'pass' => '完了', 'skip' => '一部未測定', 'fail' => '要確認', default => '未実施' };
         }
         $started=hrtime(true);
-        $sent=$this->client->editOriginal($interactionId, $token, ['content' => $content, 'components' => $result['components'] ?? []], $png);
+        $sent=$this->last=$this->client->editOriginal($interactionId, $token, ['content' => $content, 'components' => $result['components'] ?? []], $png);
         $this->diagnostics?->record('followup',['ok'=>$sent->ok,'sent'=>$sent->ok,'code'=>$sent->code,'status'=>$sent->status,
             'route'=>'followup','duration_ms'=>(int)((hrtime(true)-$started)/1000000)]);
         return $sent->ok;

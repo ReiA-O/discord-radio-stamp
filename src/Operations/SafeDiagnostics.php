@@ -22,7 +22,7 @@ final class SafeDiagnostics
         'wrong_application','administrator_scope_required','wrong_channel','invalid_interaction','unsupported_action',
         'post_response_unavailable','private_worker_configuration_required','invalid_display_name','interaction_conflict',
         'private_queue_unavailable','queued','claimed','no_job','done','retry','worker_retry','validation_followup_retry',
-        'mock_followup_retry','worker_failed','worker_claim_lost','operations_cycle','tick','operations_identity_verified','validation_bot_identity_unverified',
+        'mock_followup_retry','interaction_token_deadline','worker_failed','worker_claim_lost','operations_cycle','tick','operations_identity_verified','validation_bot_identity_unverified',
         'closed','warning_grace','warning_pending','closure_pending','room_close_pending','closure_rescheduled',
         'voice_roster_unknown','voice_roster_stale','voice_unknown','voice_observed','voice_state_unknown','voice_state_stale',
         'not_in_voice','not_in_target_voice','not_in_source_voice','disconnect_pending','move_pending','member_still_in_voice','destination_unverified','member_actions_disabled',

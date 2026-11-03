@@ -10,6 +10,10 @@ use RadioStamp\Operations\SafeDiagnostics;
 
 final class InteractionWorker
 {
+    /** Discord interaction tokens expire 15 minutes after the interaction; the margin covers one request timeout. */
+    private const TOKEN_LIFETIME = 900;
+    private const DEADLINE_MARGIN = 15;
+    private const DEADLINE_CODE = 'interaction_token_deadline';
     public function __construct(
         private readonly InteractionQueue $queue,
         private readonly RadioService $service,
@@ -83,10 +87,22 @@ final class InteractionWorker
                 $publicResult['checks'] = array_filter($result['checks'], static fn(mixed $value): bool => is_bool($value));
             }
             if (in_array($result['runtime_status'] ?? null, ['disabled', 'pass', 'skip', 'fail'], true)) { $publicResult['runtime_status'] = $result['runtime_status']; }
+            // The token only lives TOKEN_LIFETIME seconds; never send (or schedule a send) that cannot finish inside it.
+            $deadline = (int) $job['created_at'] + self::TOKEN_LIFETIME - self::DEADLINE_MARGIN;
+            if ($this->clock->now()->getTimestamp() >= $deadline) { return $this->abandon($job); }
             $followingUp = true;
             $sent=$this->sink->send($job['interaction_id'], $token, $publicResult, $png);
             $this->diagnostics?->record('followup',['ok'=>$sent,'sent'=>$sent,'code'=>$sent?'sent':'validation_followup_retry']);
             if (!$sent) {
+                $outcome = $this->sink instanceof FollowupOutcome ? $this->sink->lastResult() : null;
+                $after = $this->clock->now()->getTimestamp();
+                // Unknown webhook: the token is gone, so further PATCHes can only fail again.
+                if ($outcome?->code === 'not_found') { return $this->abandon($job); }
+                if ($outcome?->code === 'rate_limited') {
+                    $retryAt = $after + (int) ceil($outcome->retryAfter);
+                    if ($retryAt >= $deadline) { return $this->abandon($job); }
+                    return $this->retry($job, $followupRetryCode, $now, $retryAt);
+                }
                 return $this->retry($job, $followupRetryCode, $now);
             }
             $this->queue->finish($job, $code);
@@ -101,9 +117,17 @@ final class InteractionWorker
         }
     }
 
-    private function retry(array $job,string $code,int $now):array
+    private function abandon(array $job):array
     {
-        $transition=$this->queue->retry($job,$code,$now);
+        $owned=$this->queue->abandon($job,self::DEADLINE_CODE);
+        $code=$owned?self::DEADLINE_CODE:'worker_claim_lost';
+        $this->diagnostics?->record('worker_result',['ok'=>false,'code'=>$code]);
+        return ['interaction_id'=>$job['interaction_id'],'state'=>$owned?'expired':'lost','code'=>$code];
+    }
+
+    private function retry(array $job,string $code,int $now,?int $availableAt=null):array
+    {
+        $transition=$this->queue->retry($job,$code,$now,$availableAt);
         $state=match($transition){'pending'=>'retry','failed'=>'failed',default=>'lost'};
         $code=match($transition){'pending'=>$code,'failed'=>'worker_failed',default=>'worker_claim_lost'};
         $this->diagnostics?->record('worker_result',['ok'=>false,'code'=>$code]);
