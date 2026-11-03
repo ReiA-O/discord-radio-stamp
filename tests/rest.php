@@ -141,25 +141,74 @@ $capPdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRM
 $capStore->observe('guild', 'guild', ['x-ratelimit-remaining' => '0', 'x-ratelimit-reset-after' => '86400'], 200, 1.0, false, $limitNow);
 $capStore->observe('guild', 'guild', [], 429, INF, true, $limitNow);
 restCheck($capStore->cooldown('guild', $limitNow) === 3600.0 && (float) $capPdo->query('SELECT MAX(until_at) FROM discord_rest_limits')->fetchColumn() === $limitNow + 3600.0, 'bucket resets and non-finite input never exceed one hour');
-// A valid long Retry-After is honoured up to a day; only the day cap bounds it.
+// A valid long Retry-After is honoured in full: nothing is sent before Discord's interval ends.
 $longStore = $limitStore();
 $longStore->observe('guild', 'guild', [], 429, 7200.0, false, $limitNow);
 restCheck($longStore->cooldown('guild', $limitNow) === 7200.0 && $longStore->cooldown('guild', $limitNow + 7199.0) === 1.0 && $longStore->cooldown('guild', $limitNow + 7200.0) === 0.0, 'valid two-hour Retry-After honoured exactly, then released');
 $longStore->observe('self_bot', 'self_bot', [], 429, 200000.0, true, $limitNow);
-restCheck($longStore->cooldown('guild', $limitNow) === 86400.0 && $longStore->cooldown('guild', $limitNow + 86400.0) === 0.0, 'valid Retry-After beyond a day is bounded at one day');
+restCheck($longStore->cooldown('guild', $limitNow) === 200000.0 && $longStore->cooldown('guild', $limitNow + 86400.0) === 113600.0 && $longStore->cooldown('guild', $limitNow + 199999.0) === 1.0 && $longStore->cooldown('guild', $limitNow + 200000.0) === 0.0, 'valid Retry-After beyond a day is honoured in full');
+$longHttp = new RestFakeHttp([new HttpResponse(429, [], '{"retry_after":200000,"global":true}'), $guildJson()]);
+$longClient = restClient($longHttp, ['state_store' => $limitStore()] + $limitClock);
+restCheck($longClient->botRead('self_bot')->retryAfter === 200000.0, 'client reports the full long Retry-After');
+$longStart = $limitNow;
+foreach ([86400.0, 86401.0, 199999.0] as $elapsed) {
+    $limitNow = $longStart + $elapsed;
+    restCheck($longClient->botRead('guild')->code === 'rate_limited' && count($longHttp->requests) === 1, 'no request ' . $elapsed . ' s into a 200000 s Retry-After');
+}
+$limitNow = $longStart + 200000.0;
+restCheck($longClient->botRead('guild')->ok && count($longHttp->requests) === 2, 'request resumes when the full Retry-After ends');
+$limitNow = $longStart;
+// A clock stepped back keeps the full observed interval from now, never more; a forward step cannot be told apart and ends it.
+$stepStore = $limitStore(); $stepStore->observe('guild', 'guild', [], 429, 100.0, false, $limitNow);
+restCheck($stepStore->cooldown('guild', $limitNow - 1000.0) === 100.0 && $stepStore->cooldown('guild', $limitNow + 40.0) === 60.0, 'clock stepped back re-bases to the observed interval');
+$stepStore->observe('guild', 'guild', [], 429, 10.0, false, $limitNow - 1000.0);
+restCheck($stepStore->cooldown('guild', $limitNow - 1000.0) === 100.0 && $stepStore->cooldown('guild', $limitNow - 901.0) === 1.0 && $stepStore->cooldown('guild', $limitNow - 900.0) === 0.0, 'write after a backward step keeps the longer re-based wait');
+// Rows from the previous release (prefixed, no seen time) stay valid within their one-day horizon only.
+$prevPdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]); $prevStore = new RestStateStore($prevPdo);
+$prevPdo->prepare("INSERT INTO discord_rest_limits(limit_key,until_at) VALUES ('v2:global',?),('v2:route:guild',?)")->execute([$limitNow + 600.0, $limitNow + 90000.0]);
+restCheck($prevStore->cooldown('self_bot', $limitNow) === 600.0 && $prevStore->cooldown('guild', $limitNow) === 600.0, 'previous-release row within a day still applies; one beyond a day is ignored');
+$prevStore->observe('guild', 'guild', [], 429, 5.0, false, $limitNow);
+restCheck($prevStore->cooldown('guild', $limitNow) === 600.0 && (float) $prevPdo->query("SELECT until_at FROM discord_rest_limits WHERE limit_key='v2:route:guild'")->fetchColumn() === $limitNow + 5.0, 'previous-release row beyond a day is replaced on write');
 $resetStore = $limitStore(); $resetStore->observe('missing_reset', 'missing_reset', ['x-ratelimit-remaining' => '0'], 200, 1.0, false, $limitNow);
 restCheck($resetStore->cooldown('missing_reset', $limitNow) === 5.0, 'exhausted bucket without reset-after waits five seconds, not a day');
 $interactionStore = $limitStore(); $interactionToken = 'FICTIONAL_INTERACTION_TOKEN_FOR_MOCK_ONLY'; $interactionId = '900000000000000401';
 $interactionHttp = new RestFakeHttp([new HttpResponse(429, [], '{"retry_after":30,"global":true}'), restJson(['id' => $interactionId]), new HttpResponse(429, [], '{"retry_after":60,"global":true}'), $guildJson()]);
 $interactionClient = restClient($interactionHttp, ['state_store' => $interactionStore] + $limitClock);
 restCheck($interactionClient->botRead('guild')->code === 'rate_limited' && $interactionStore->cooldown('guild', $limitNow) === 30.0, 'bot global limit recorded');
-restCheck($interactionStore->cooldown('interaction_edit', $limitNow) === 0.0 && $interactionClient->editOriginal($interactionId, $interactionToken, ['content' => 'x'])->ok && count($interactionHttp->requests) === 2, 'interaction_edit ignores the bot global cooldown');
+restCheck($interactionStore->cooldown('interaction_edit', $limitNow, $interactionToken) === 0.0 && $interactionClient->editOriginal($interactionId, $interactionToken, ['content' => 'x'])->ok && count($interactionHttp->requests) === 2, 'interaction_edit ignores the bot global cooldown');
 $interactionLimited = $interactionClient->editOriginal($interactionId, $interactionToken, ['content' => 'x']);
-restCheck($interactionLimited->code === 'rate_limited' && $interactionStore->cooldown('interaction_edit', $limitNow) === 60.0, 'interaction_edit 429 pauses its own route');
-$tokenStore = $limitStore(); $tokenStore->observe('interaction_edit', 'interaction_edit', [], 429, 7200.0, true, $limitNow);
-restCheck($tokenStore->cooldown('interaction_edit', $limitNow) === 900.0 && $tokenStore->cooldown('interaction_edit', $limitNow + 900.0) === 0.0 && $tokenStore->cooldown('guild', $limitNow) === 0.0, 'long interaction Retry-After is bounded by the token lifetime and never global');
+restCheck($interactionLimited->code === 'rate_limited' && $interactionStore->cooldown('interaction_edit', $limitNow, $interactionToken) === 60.0, 'interaction_edit 429 pauses its own token');
+restCheck($interactionStore->cooldown('interaction_edit', $limitNow, 'FICTIONAL_OTHER_INTERACTION_TOKEN_MOCK') === 0.0, 'another interaction token is not paused');
+$tokenStore = $limitStore(); $tokenStore->observe('interaction_edit', 'TOKEN_A', [], 429, 7200.0, true, $limitNow);
+restCheck($tokenStore->cooldown('interaction_edit', $limitNow, 'TOKEN_A') === 7200.0 && $tokenStore->cooldown('interaction_edit', $limitNow + 900.0, 'TOKEN_A') === 6300.0 && $tokenStore->cooldown('interaction_edit', $limitNow + 7200.0, 'TOKEN_A') === 0.0 && $tokenStore->cooldown('guild', $limitNow) === 0.0, 'long interaction Retry-After is honoured in full for its token and never global');
+restCheck($tokenStore->cooldown('interaction_edit', $limitNow, 'TOKEN_B') === 0.0, 'one token\'s long Retry-After never holds back other interactions');
+$tokenStore->observe('interaction_edit', 'TOKEN_A', ['x-ratelimit-bucket' => 'webhook_bucket', 'x-ratelimit-remaining' => '0', 'x-ratelimit-reset-after' => '30'], 200, 1.0, false, $limitNow);
+restCheck($tokenStore->cooldown('interaction_edit', $limitNow, 'TOKEN_B') === 0.0, 'an exhausted bucket on one token never pauses another token');
 $limitNow += 30.0;
 restCheck($interactionClient->botRead('guild')->ok && count($interactionHttp->requests) === 4, 'interaction 429 marked global never writes the bot global limit');
+// Discord limits interaction webhooks per token: a long Retry-After for one user's reply never blocks another user's reply.
+$otherToken = 'FICTIONAL_SECOND_INTERACTION_TOKEN_MOCK';
+$perTokenPdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]); $perTokenStore = new RestStateStore($perTokenPdo);
+$perTokenHttp = new RestFakeHttp([new HttpResponse(429, [], '{"retry_after":7200}'), restJson(['id' => $interactionId])]);
+$perTokenClient = restClient($perTokenHttp, ['state_store' => $perTokenStore] + $limitClock);
+restCheck($perTokenClient->editOriginal($interactionId, $interactionToken, ['content' => 'x'])->retryAfter === 7200.0, 'interaction 429 reports its full Retry-After');
+restCheck($perTokenClient->editOriginal($interactionId, $otherToken, ['content' => 'x'])->ok && count($perTokenHttp->requests) === 2, 'another token still sends during the first token\'s Retry-After');
+restCheck($perTokenClient->editOriginal($interactionId, $interactionToken, ['content' => 'x'])->code === 'rate_limited' && count($perTokenHttp->requests) === 2, 'the limited token sends nothing during its Retry-After');
+restCheck((int) $perTokenPdo->query("SELECT COUNT(*) FROM discord_rest_limits WHERE instr(limit_key, 'FICTIONAL') > 0")->fetchColumn() === 0 && (int) $perTokenPdo->query('SELECT COUNT(*) FROM discord_rest_routes')->fetchColumn() === 0, 'only a hash of the token is stored');
+$perTokenStore->observe('guild', 'guild', [], 429, 1.0, false, $limitNow + 7200.0);
+restCheck((int) $perTokenPdo->query("SELECT COUNT(*) FROM discord_rest_limits WHERE limit_key LIKE '%interaction%'")->fetchColumn() === 0, 'expired token rows and their seen rows are purged on the next write');
+// A finite Retry-After beyond a week is malformed: not adopted, only its route pauses for sixty seconds, never global.
+$hugeStore = $limitStore(); $hugeStore->observe('self_bot', 'self_bot', [], 429, 1e9, true, $limitNow);
+restCheck($hugeStore->cooldown('guild', $limitNow) === 0.0 && $hugeStore->cooldown('self_bot', $limitNow) === 60.0 && $hugeStore->cooldown('self_bot', $limitNow + 60.0) === 0.0, 'huge finite Retry-After pauses only its route for sixty seconds');
+$weekStore = $limitStore(); $weekStore->observe('self_bot', 'self_bot', [], 429, 604800.0, true, $limitNow); $weekStore->observe('guild', 'guild', [], 429, 604801.0, false, $limitNow);
+restCheck($weekStore->cooldown('member', $limitNow + 604799.0) === 1.0 && $weekStore->cooldown('member', $limitNow + 604800.0) === 0.0 && $weekStore->cooldown('guild', $limitNow + 604799.0) === 1.0, 'exactly a week is honoured in full');
+$overStore = $limitStore(); $overStore->observe('guild', 'guild', [], 429, 604801.0, false, $limitNow);
+restCheck($overStore->cooldown('guild', $limitNow) === 60.0 && $overStore->cooldown('guild', $limitNow + 60.0) === 0.0, 'one second beyond a week is malformed');
+$hugeHttp = new RestFakeHttp([new HttpResponse(429, ['Retry-After' => '1000000000'], '{"retry_after":1000000000,"global":true}'), $guildJson()]);
+$hugeClient = restClient($hugeHttp, ['state_store' => $limitStore()] + $limitClock);
+$hugeLimited = $hugeClient->botRead('self_bot');
+restCheck($hugeLimited->code === 'rate_limit_invalid' && $hugeLimited->retryAfter === 60.0, 'client treats a huge Retry-After as invalid guidance');
+restCheck($hugeClient->botRead('guild')->ok && $hugeClient->botRead('self_bot')->code === 'rate_limited' && count($hugeHttp->requests) === 2, 'huge global 429 never stops other routes');
 
 // A slow response must never consume its own relative cooldown while in flight.
 foreach (['retry_after', 'reset_after'] as $case) {

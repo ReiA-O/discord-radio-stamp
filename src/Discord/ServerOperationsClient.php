@@ -486,10 +486,10 @@ final class ServerOperationsClient
             catch(\Throwable $error){$this->diagnostics?->exception('rest_exception',$error);if($response->status!==429){return new RestResult(false,'response_invalid',$response->status);}$data=[];$jsonValid=false;}
             if(!is_array($data)){return new RestResult(false,'response_invalid');}
             $headers=[];foreach($response->headers as$key=>$value){if(is_string($key)&&(is_string($value)||is_int($value))){$headers[strtolower($key)]=(string)$value;}}
-            // Body retry_after, else a valid Retry-After header; missing/invalid guidance is a short route pause, never global.
-            $retry=null;foreach([$jsonValid?($data['retry_after']??null):null,$headers['retry-after']??null]as$candidate){if($retry===null&&is_numeric($candidate)&&is_finite((float)$candidate)&&(float)$candidate>=0){$retry=max(0.25,min(RestStateStore::MAX_RETRY_AFTER,(float)$candidate));}}
-            $retry??=$response->status===429?60.0:1.0;
-            $this->limits->observe($route,$route,$headers,$response->status,$retry,($data['global']??false)===true||($headers['x-ratelimit-global']??'')==='true'||($headers['x-ratelimit-scope']??'')==='global',($this->now)());
+            // Body retry_after, else a valid Retry-After header; missing/invalid guidance (or beyond a week) is a short route pause, never global.
+            $retry=null;foreach([$jsonValid?($data['retry_after']??null):null,$headers['retry-after']??null]as$candidate){if($retry===null&&is_numeric($candidate)&&is_finite((float)$candidate)&&(float)$candidate>=0&&(float)$candidate<=RestStateStore::MAX_VALID_RETRY_AFTER){$retry=max(0.25,(float)$candidate);}}
+            $guided=$retry!==null;$retry??=$response->status===429?RestStateStore::INVALID_RETRY_PAUSE:1.0;
+            $this->limits->observe($route,$route,$headers,$response->status,$retry,$guided&&(($data['global']??false)===true||($headers['x-ratelimit-global']??'')==='true'||($headers['x-ratelimit-scope']??'')==='global'),($this->now)());
             if($response->status===401){$this->authenticationFailed=true;}
             return $response->status>=200&&$response->status<300?new RestResult(true,'ok',$response->status,$data,outcome:TransportOutcome::Succeeded)
                 :new RestResult(false,match($response->status){401=>'unauthorized',403=>'forbidden',404=>'not_found',429=>'rate_limited',default=>'discord_rejected'},$response->status,[],$response->status===429?$retry:0,
