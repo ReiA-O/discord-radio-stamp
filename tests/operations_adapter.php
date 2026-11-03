@@ -160,6 +160,13 @@ $same(['v2:global'=>$at+200000,'v2:route:voice:read'=>$at+200000],$limitRows($db
 $longAt=$at;$at+=86400;$same('rate_limited',$client->readVoice($user)->code,'no request when a day has passed');
 $at=$longAt+199999;$same('rate_limited',$client->readVoice($user)->code,'no request one second before the interval ends');$same(1,count($http->calls),'long limit sends nothing before it ends');
 $at=$longAt+200000;$http->next=new HttpResponse(200,[],json_encode(['user_id'=>$user,'channel_id'=>null]));$client->readVoice($user);$same(2,count($http->calls),'request resumes only when the full interval ends');$at=$longAt;
+[$db,$http,$client]=operationsFixture(['enabled'=>true,'posts_enabled'=>true]+$fixedNow);$http->next=new HttpResponse(429,['x-ratelimit-global'=>'true'],json_encode(['retry_after'=>1e9,'global'=>true]));
+$same(60.0,$client->readVoice($user)->retryAfter,'retry_after beyond a week is malformed and uses the short default');
+$same(['v2:route:voice:read'=>$at+60],$limitRows($db),'malformed huge global 429 pauses only its route');
+$same(true,$client->postReceipt($session,$deadline,'huge-429-other-route')->ok,'malformed huge 429 never stops other routes');
+[$db,$http,$client]=operationsFixture(['enabled'=>true]+$fixedNow);$http->next=new HttpResponse(429,['x-ratelimit-global'=>'true'],json_encode(['retry_after'=>604800,'global'=>true]));
+$same(604800.0,$client->readVoice($user)->retryAfter,'retry_after of exactly a week is still honoured in full');
+$same(['v2:global'=>$at+604800,'v2:route:voice:read'=>$at+604800],$limitRows($db),'week-long global 429 is stored globally');
 [$db,$http,$client]=operationsFixture(['enabled'=>true]);$http->next=new HttpResponse(401,[],'not-json');
 $same('unauthorized',$client->readVoice($user)->code,'non-JSON 401 still stops authentication');
 $same('unauthorized',$client->readVoice($user)->code,'non-JSON auth failure retains circuit');

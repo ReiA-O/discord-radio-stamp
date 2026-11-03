@@ -20,8 +20,18 @@ final class RestStateStore
     private const SEEN_PREFIX = 'seen:';
     /** Rows written by this release; unprefixed rows from older releases are never read and are purged on write. */
     private const KEY_PREFIX = 'v2:';
-    /** Interaction webhook endpoints are not bound by the bot's global rate limit. */
+    /**
+     * A finite Retry-After beyond a week is malformed guidance, not a plausible interval: like a missing value it is
+     * not adopted and only pauses its own route for INVALID_RETRY_PAUSE, never global (a bad 429 must not stop the bot).
+     */
+    public const MAX_VALID_RETRY_AFTER = 604800.0;
+    public const INVALID_RETRY_PAUSE = 60.0;
+    /**
+     * Interaction webhook endpoints are not bound by the bot's global rate limit, and Discord limits them per token,
+     * so their limits are kept per hash(token): one user's long Retry-After never holds back replies to others.
+     */
     private const INTERACTION_ROUTES = ['interaction_edit'];
+    private const TOKEN_ROUTE_PREFIX = 'route:interaction_edit:';
     public static function openExisting(PDO $pdo):self{return new self($pdo,false);}
 
     /** Structural preflight only; never creates tables, changes journals, or seeds state. */
@@ -42,17 +52,20 @@ final class RestStateStore
         $pdo->exec('CREATE TABLE IF NOT EXISTS discord_rest_routes (route_key TEXT PRIMARY KEY, bucket_key TEXT NOT NULL)');
         $pdo->exec("CREATE TABLE IF NOT EXISTS discord_rest_commands (command_key TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending', lease_until REAL NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0)");
     }
-    public function cooldown(string $route, float $now): float
+    /** $major is the interaction token for interaction routes; only its hash is stored. Other routes ignore it here. */
+    public function cooldown(string $route, float $now, string $major = ''): float
     {
         // Older releases' rows have no prefix, so a day-long legacy row can never come back into range as time passes.
         $query = $this->pdo->prepare('SELECT MAX(' . self::remainingSql('l.until_at', 's.until_at') . ') FROM discord_rest_limits l LEFT JOIN discord_rest_limits s ON s.limit_key=? || substr(l.limit_key,?) WHERE l.limit_key IN (?, ?, ? || COALESCE((SELECT bucket_key FROM discord_rest_routes WHERE route_key=?), ?))');
-        $query->execute([$now + self::LEGACY_HORIZON, $now, $now, $now, self::KEY_PREFIX . self::SEEN_PREFIX, strlen(self::KEY_PREFIX) + 1, self::KEY_PREFIX . (in_array($route, self::INTERACTION_ROUTES, true) ? 'none' : 'global'), self::KEY_PREFIX . 'route:' . $route, self::KEY_PREFIX, $route, 'none']);
+        $query->execute([$now + self::LEGACY_HORIZON, $now, $now, $now, self::KEY_PREFIX . self::SEEN_PREFIX, strlen(self::KEY_PREFIX) + 1, self::KEY_PREFIX . (in_array($route, self::INTERACTION_ROUTES, true) ? 'none' : 'global'), self::KEY_PREFIX . 'route:' . self::routeKey($route, $major), self::KEY_PREFIX, $route, 'none']);
         return max(0.0, (float) $query->fetchColumn());
     }
     public function observe(string $route, string $major, array $headers, int $status, float $retryAfter, bool $global, float $now): void
     {
-        $bucket = 'route:' . $route;
-        if (isset($headers['x-ratelimit-bucket']) && is_string($headers['x-ratelimit-bucket']) && preg_match('/\A[A-Za-z0-9._-]{1,128}\z/D', $headers['x-ratelimit-bucket'])) {
+        $interaction = in_array($route, self::INTERACTION_ROUTES, true);
+        $bucket = 'route:' . self::routeKey($route, $major);
+        // A learned bucket is mapped per route name, which interaction tokens share, so token routes keep only their own row.
+        if (!$interaction && isset($headers['x-ratelimit-bucket']) && is_string($headers['x-ratelimit-bucket']) && preg_match('/\A[A-Za-z0-9._-]{1,128}\z/D', $headers['x-ratelimit-bucket'])) {
             $bucket = 'bucket:' . hash('sha256', $major . ':' . $headers['x-ratelimit-bucket']);
             $map = $this->pdo->prepare('INSERT INTO discord_rest_routes(route_key,bucket_key) VALUES (?,?) ON CONFLICT(route_key) DO UPDATE SET bucket_key=excluded.bucket_key');
             $map->execute([$route, $bucket]);
@@ -60,15 +73,17 @@ final class RestStateStore
         $reset = is_numeric($headers['x-ratelimit-reset-after'] ?? null) && is_finite((float) $headers['x-ratelimit-reset-after']) && (float) $headers['x-ratelimit-reset-after'] >= 0 ? (float) $headers['x-ratelimit-reset-after'] : 5.0;
         if (($headers['x-ratelimit-remaining'] ?? null) === '0' && $reset > 0) { $this->putLimit($bucket, $this->until($now, $reset), $now); }
         if ($status === 429) {
-            // An interaction route never writes the bot-wide global limit it is exempt from.
-            $global = $global && !in_array($route, self::INTERACTION_ROUTES, true);
+            $malformed = is_finite($retryAfter) && $retryAfter > self::MAX_VALID_RETRY_AFTER;
+            // An interaction route never writes the bot-wide global limit it is exempt from; malformed guidance is never global.
+            $global = $global && !$interaction && !$malformed;
             // A valid Retry-After is honoured in full, interaction routes included; only non-finite input falls back to the one-hour cap.
-            $retryUntil = $this->until($now, max(0.25, $retryAfter), INF);
+            $retryUntil = $this->until($now, $malformed ? self::INVALID_RETRY_PAUSE : max(0.25, $retryAfter), INF);
             $this->putLimit($global ? 'global' : $bucket, $retryUntil, $now);
             // Route fallback protects requests before a bucket has been learned.
-            $this->putLimit('route:' . $route, $retryUntil, $now);
+            $this->putLimit('route:' . self::routeKey($route, $major), $retryUntil, $now);
         }
     }
+    private static function routeKey(string $route, string $major): string { return in_array($route, self::INTERACTION_ROUTES, true) ? $route . ':' . hash('sha256', $major) : $route; }
     private function until(float $now, float $duration, float $cap = self::MAX_COOLDOWN): float { return $now + (is_finite($duration) ? max(0.0, min($cap, $duration)) : self::MAX_COOLDOWN); }
     /**
      * Seconds a row still applies: a stepped-back clock (seen>now) keeps the full observed interval from now, never more;
@@ -81,6 +96,11 @@ final class RestStateStore
     private function putLimit(string $key, float $until, float $now): void
     {
         $this->pdo->prepare('DELETE FROM discord_rest_limits WHERE substr(limit_key,1,?)<>?')->execute([strlen(self::KEY_PREFIX), self::KEY_PREFIX]);
+        // Token rows (one per interaction) are dropped once they no longer apply, with their seen rows, so the table stays small.
+        $tokenPrefix = self::KEY_PREFIX . self::TOKEN_ROUTE_PREFIX;
+        $this->pdo->prepare('DELETE FROM discord_rest_limits WHERE substr(limit_key,1,?)=? AND until_at<=? AND COALESCE((SELECT s.until_at FROM discord_rest_limits s WHERE s.limit_key=? || substr(discord_rest_limits.limit_key,?)),0)<=?')->execute([strlen($tokenPrefix), $tokenPrefix, $now, self::KEY_PREFIX . self::SEEN_PREFIX, strlen(self::KEY_PREFIX) + 1, $now]);
+        $seenTokenPrefix = self::KEY_PREFIX . self::SEEN_PREFIX . self::TOKEN_ROUTE_PREFIX;
+        $this->pdo->prepare('DELETE FROM discord_rest_limits WHERE substr(limit_key,1,?)=? AND NOT EXISTS (SELECT 1 FROM discord_rest_limits l WHERE l.limit_key=? || substr(discord_rest_limits.limit_key,?))')->execute([strlen($seenTokenPrefix), $seenTokenPrefix, self::KEY_PREFIX, strlen(self::KEY_PREFIX . self::SEEN_PREFIX) + 1]);
         // The existing row keeps only what it still applies (re-based after a clock step); the longer wait wins.
         $seenKey = self::KEY_PREFIX . self::SEEN_PREFIX . $key;
         $query = $this->pdo->prepare('INSERT INTO discord_rest_limits(limit_key,until_at) VALUES (?,?) ON CONFLICT(limit_key) DO UPDATE SET until_at=MAX(excluded.until_at,?+MAX(0,' . self::remainingSql('discord_rest_limits.until_at', '(SELECT s.until_at FROM discord_rest_limits s WHERE s.limit_key=?)') . '))');

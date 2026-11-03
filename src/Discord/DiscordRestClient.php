@@ -120,7 +120,7 @@ final class DiscordRestClient
                 $headers = ['Content-Type: multipart/form-data; boundary=' . $boundary];
                 $body = '--' . $boundary . "\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n" . $json . "\r\n--" . $boundary . "\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"card.png\"\r\nContent-Type: image/png\r\n\r\n" . $png . "\r\n--" . $boundary . "--\r\n";
             }
-            $result = $this->request('PATCH', '/webhooks/' . $this->applicationId . '/' . rawurlencode($callbackToken) . '/messages/@original', 'interaction_edit', $this->applicationId, $body, $headers, false);
+            $result = $this->request('PATCH', '/webhooks/' . $this->applicationId . '/' . rawurlencode($callbackToken) . '/messages/@original', 'interaction_edit', $callbackToken, $body, $headers, false);
             return $result->ok ? new RestResult(true, 'original_updated', $result->status) : $result;
         } catch (\Throwable) { return new RestResult(false, 'payload_invalid'); }
     }
@@ -241,7 +241,7 @@ final class DiscordRestClient
         if (!$this->enabled) { return new RestResult(false, 'transport_disabled'); }
         if ($botAuth && $this->authenticationFailed) { return new RestResult(false, 'unauthorized', 401, [], 0.0, true); }
         try {
-            $now = ($this->now)(); $wait = $this->store->cooldown($route, $now);
+            $now = ($this->now)(); $wait = $this->store->cooldown($route, $now, $major);
             if ($wait > 0) { return new RestResult(false, 'rate_limited', 429, [], $wait, true); }
             if ($this->inlineOnly && $this->inlineCalls >= 1) { return new RestResult(false, 'operation_budget_exhausted'); }
             $timeout = $this->timeoutMs;
@@ -268,15 +268,15 @@ final class DiscordRestClient
             foreach ($response->headers as $key => $value) {
                 if (is_string($key) && (is_string($value) || is_int($value))) { $rateHeaders[strtolower($key)] = (string) $value; }
             }
-            // Invalid values are ignored; a 429 without any valid guidance is a short route pause, never global.
+            // Invalid values (including finite ones beyond a week) are ignored; a 429 without any valid guidance is a short route pause, never global.
             $durations = [];
             foreach ([$rateHeaders['retry-after'] ?? null, $data['retry_after'] ?? null] as $duration) {
-                if ($duration === null || !is_numeric($duration) || !is_finite((float) $duration) || (float) $duration < 0) { continue; }
+                if ($duration === null || !is_numeric($duration) || !is_finite((float) $duration) || (float) $duration < 0 || (float) $duration > RestStateStore::MAX_VALID_RETRY_AFTER) { continue; }
                 $durations[] = (float) $duration;
             }
             $invalidRate = $response->status === 429 && $durations === [];
-            $retry = $invalidRate ? 60.0 : max(0.25, ...($durations === [] ? [1.0] : $durations));
-            $global = ($data['global'] ?? false) === true || strtolower($rateHeaders['x-ratelimit-global'] ?? '') === 'true' || ($rateHeaders['x-ratelimit-scope'] ?? '') === 'global';
+            $retry = $invalidRate ? RestStateStore::INVALID_RETRY_PAUSE : max(0.25, ...($durations === [] ? [1.0] : $durations));
+            $global = !$invalidRate && (($data['global'] ?? false) === true || strtolower($rateHeaders['x-ratelimit-global'] ?? '') === 'true' || ($rateHeaders['x-ratelimit-scope'] ?? '') === 'global');
             $this->store->observe($route, $major, $rateHeaders, $response->status, $retry, $global, $receivedAt);
             if ($botAuth && $response->status === 401) { $this->authenticationFailed = true; }
             if ($response->status >= 200 && $response->status < 300) {
