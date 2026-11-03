@@ -10,7 +10,11 @@ final class RestStateStore
 {
     /** Cap for bucket resets and unusable guidance; Discord's ordinary limits reset well within an hour. */
     private const MAX_COOLDOWN = 3600.0;
-    /** A valid 429 retry interval is honoured in full up to a day, so nothing retries before Discord allows. */
+    /**
+     * A valid 429 retry interval is honoured in full up to a day. Discord documents no maximum, so a longer value is
+     * retried after a day: that costs one request, whose 429 sets the next day. Without a finite bound one bad value
+     * would stop all REST indefinitely, and rows beyond now+MAX_RETRY_AFTER could not be told apart from a clock step.
+     */
     public const MAX_RETRY_AFTER = 86400.0;
     /** Rows written by this release; unprefixed rows from older releases are never read and are purged on write. */
     private const KEY_PREFIX = 'v2:';

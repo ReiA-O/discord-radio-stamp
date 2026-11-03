@@ -156,6 +156,9 @@ $same(86400.0,$client->readVoice($user)->retryAfter,'valid day-long retry_after 
 $same(['v2:global'=>$at+86400,'v2:route:voice:read'=>$at+86400],$limitRows($db),'explicit global 429 is stored globally for its full valid interval');
 [$db,$http,$client]=operationsFixture(['enabled'=>true]+$fixedNow);$http->next=new HttpResponse(429,['x-ratelimit-global'=>'true'],json_encode(['retry_after'=>200000,'global'=>true]));
 $same(86400.0,$client->readVoice($user)->retryAfter,'retry_after beyond a day is bounded at one day');
+$at+=86399;$same('rate_limited',$client->readVoice($user)->code,'no request before the day cap ends');$same(1,count($http->calls),'bounded long limit sends nothing during the day');
+$at+=1;$http->next=new HttpResponse(429,['x-ratelimit-global'=>'true'],json_encode(['retry_after'=>200000,'global'=>true]));$same(86400.0,$client->readVoice($user)->retryAfter,'a still-active long limit is re-armed by the one request after a day');
+$same(2,count($http->calls),'a limit beyond a day costs one request per day');$same(['v2:global'=>$at+86400,'v2:route:voice:read'=>$at+86400],$limitRows($db),'re-armed limit is stored for another day');
 [$db,$http,$client]=operationsFixture(['enabled'=>true]);$http->next=new HttpResponse(401,[],'not-json');
 $same('unauthorized',$client->readVoice($user)->code,'non-JSON 401 still stops authentication');
 $same('unauthorized',$client->readVoice($user)->code,'non-JSON auth failure retains circuit');
