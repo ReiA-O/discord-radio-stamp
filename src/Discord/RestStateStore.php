@@ -11,17 +11,17 @@ final class RestStateStore
     /** Cap for bucket resets and unusable guidance; Discord's ordinary limits reset well within an hour. */
     private const MAX_COOLDOWN = 3600.0;
     /**
-     * A valid 429 retry interval is honoured in full up to a day. Discord documents no maximum, so a longer value is
-     * retried after a day: that costs one request, whose 429 sets the next day. Without a finite bound one bad value
-     * would stop all REST indefinitely, and rows beyond now+MAX_RETRY_AFTER could not be told apart from a clock step.
+     * A valid, finite 429 retry interval is honoured in full: no request is sent before it ends (Discord's rate-limit rules).
+     * Each limit row has a companion "seen:" row holding when it was observed, so a clock stepped back is detected
+     * by seen>now and the wait is re-based to the full interval from now instead of being dropped or stretched.
+     * Rows without a companion were written by the previous release, which never stored more than a day ahead.
      */
-    public const MAX_RETRY_AFTER = 86400.0;
+    private const LEGACY_HORIZON = 86400.0;
+    private const SEEN_PREFIX = 'seen:';
     /** Rows written by this release; unprefixed rows from older releases are never read and are purged on write. */
     private const KEY_PREFIX = 'v2:';
     /** Interaction webhook endpoints are not bound by the bot's global rate limit. */
     private const INTERACTION_ROUTES = ['interaction_edit'];
-    /** An interaction token lives 15 minutes, and the shared interaction route must not stall every later reply for longer. */
-    private const MAX_INTERACTION_COOLDOWN = 900.0;
     public static function openExisting(PDO $pdo):self{return new self($pdo,false);}
 
     /** Structural preflight only; never creates tables, changes journals, or seeds state. */
@@ -45,10 +45,9 @@ final class RestStateStore
     public function cooldown(string $route, float $now): float
     {
         // Older releases' rows have no prefix, so a day-long legacy row can never come back into range as time passes.
-        // Rows beyond now+MAX_RETRY_AFTER can only come from a clock step and are ignored.
-        $query = $this->pdo->prepare('SELECT MAX(until_at) FROM discord_rest_limits WHERE until_at<=? AND limit_key IN (?, ?, ? || COALESCE((SELECT bucket_key FROM discord_rest_routes WHERE route_key=?), ?))');
-        $query->execute([$now + self::MAX_RETRY_AFTER, self::KEY_PREFIX . (in_array($route, self::INTERACTION_ROUTES, true) ? 'none' : 'global'), self::KEY_PREFIX . 'route:' . $route, self::KEY_PREFIX, $route, 'none']);
-        return min(self::MAX_RETRY_AFTER, max(0.0, (float) $query->fetchColumn() - $now));
+        $query = $this->pdo->prepare('SELECT MAX(' . self::remainingSql('l.until_at', 's.until_at') . ') FROM discord_rest_limits l LEFT JOIN discord_rest_limits s ON s.limit_key=? || substr(l.limit_key,?) WHERE l.limit_key IN (?, ?, ? || COALESCE((SELECT bucket_key FROM discord_rest_routes WHERE route_key=?), ?))');
+        $query->execute([$now + self::LEGACY_HORIZON, $now, $now, $now, self::KEY_PREFIX . self::SEEN_PREFIX, strlen(self::KEY_PREFIX) + 1, self::KEY_PREFIX . (in_array($route, self::INTERACTION_ROUTES, true) ? 'none' : 'global'), self::KEY_PREFIX . 'route:' . $route, self::KEY_PREFIX, $route, 'none']);
+        return max(0.0, (float) $query->fetchColumn());
     }
     public function observe(string $route, string $major, array $headers, int $status, float $retryAfter, bool $global, float $now): void
     {
@@ -63,20 +62,30 @@ final class RestStateStore
         if ($status === 429) {
             // An interaction route never writes the bot-wide global limit it is exempt from.
             $global = $global && !in_array($route, self::INTERACTION_ROUTES, true);
-            // A valid Retry-After is honoured up to a day (interaction routes: the token lifetime); only non-finite input falls back to the one-hour cap.
-            $retryUntil = $this->until($now, max(0.25, $retryAfter), in_array($route, self::INTERACTION_ROUTES, true) ? self::MAX_INTERACTION_COOLDOWN : self::MAX_RETRY_AFTER);
+            // A valid Retry-After is honoured in full, interaction routes included; only non-finite input falls back to the one-hour cap.
+            $retryUntil = $this->until($now, max(0.25, $retryAfter), INF);
             $this->putLimit($global ? 'global' : $bucket, $retryUntil, $now);
             // Route fallback protects requests before a bucket has been learned.
             $this->putLimit('route:' . $route, $retryUntil, $now);
         }
     }
     private function until(float $now, float $duration, float $cap = self::MAX_COOLDOWN): float { return $now + (is_finite($duration) ? max(0.0, min($cap, $duration)) : self::MAX_COOLDOWN); }
+    /**
+     * Seconds a row still applies: a stepped-back clock (seen>now) keeps the full observed interval from now, never more;
+     * a row without a seen time (previous release) is ignored beyond its one-day horizon. Binds now+horizon, now, now, now.
+     */
+    private static function remainingSql(string $until, string $seen): string
+    {
+        return "CASE WHEN $seen IS NULL THEN CASE WHEN $until<=? THEN $until-? ELSE 0 END WHEN $seen>? THEN $until-$seen ELSE $until-? END";
+    }
     private function putLimit(string $key, float $until, float $now): void
     {
         $this->pdo->prepare('DELETE FROM discord_rest_limits WHERE substr(limit_key,1,?)<>?')->execute([strlen(self::KEY_PREFIX), self::KEY_PREFIX]);
-        // A row beyond the day cap (clock step) is replaced instead of being kept by MAX().
-        $query = $this->pdo->prepare('INSERT INTO discord_rest_limits(limit_key,until_at) VALUES (?,?) ON CONFLICT(limit_key) DO UPDATE SET until_at=CASE WHEN discord_rest_limits.until_at>? THEN excluded.until_at ELSE MAX(discord_rest_limits.until_at,excluded.until_at) END');
-        $query->execute([self::KEY_PREFIX . $key, $until, $now + self::MAX_RETRY_AFTER]);
+        // The existing row keeps only what it still applies (re-based after a clock step); the longer wait wins.
+        $seenKey = self::KEY_PREFIX . self::SEEN_PREFIX . $key;
+        $query = $this->pdo->prepare('INSERT INTO discord_rest_limits(limit_key,until_at) VALUES (?,?) ON CONFLICT(limit_key) DO UPDATE SET until_at=MAX(excluded.until_at,?+MAX(0,' . self::remainingSql('discord_rest_limits.until_at', '(SELECT s.until_at FROM discord_rest_limits s WHERE s.limit_key=?)') . '))');
+        $query->execute([self::KEY_PREFIX . $key, $until, $now, $seenKey, $now + self::LEGACY_HORIZON, $now, $seenKey, $now, $seenKey, $now]);
+        $this->pdo->prepare('INSERT INTO discord_rest_limits(limit_key,until_at) VALUES (?,?) ON CONFLICT(limit_key) DO UPDATE SET until_at=excluded.until_at')->execute([$seenKey, $now]);
     }
     /** Atomic per-definition lease and a total cap of three HTTP attempts. */
     public function claimCommand(string $key, float $now): string

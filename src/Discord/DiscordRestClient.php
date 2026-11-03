@@ -272,7 +272,7 @@ final class DiscordRestClient
             $durations = [];
             foreach ([$rateHeaders['retry-after'] ?? null, $data['retry_after'] ?? null] as $duration) {
                 if ($duration === null || !is_numeric($duration) || !is_finite((float) $duration) || (float) $duration < 0) { continue; }
-                $durations[] = min(RestStateStore::MAX_RETRY_AFTER, (float) $duration);
+                $durations[] = (float) $duration;
             }
             $invalidRate = $response->status === 429 && $durations === [];
             $retry = $invalidRate ? 60.0 : max(0.25, ...($durations === [] ? [1.0] : $durations));
