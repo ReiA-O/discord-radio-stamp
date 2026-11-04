@@ -2,14 +2,22 @@
 declare(strict_types=1);
 namespace RadioStamp\Http;
 
+use RadioStamp\Discord\RestResult;
+
 /** A deterministic boundary record. It does not contact Discord or retain tokens. */
-final class MockFollowupSink implements FollowupSink
+final class MockFollowupSink implements FollowupSink, FollowupOutcome
 {
     public array $records = [];
     public bool $succeed = true;
+    /** Simulated reason for a failed send (e.g. rate_limited with retryAfter, not_found); null = unknown. */
+    public ?RestResult $failure = null;
+    public int $sends = 0;
+
+    public function lastResult(): ?RestResult { return $this->succeed ? null : $this->failure; }
 
     public function send(string $interactionId, string $token, array $result, ?string $png): bool
     {
+        ++$this->sends;
         if (!$this->succeed) { return false; }
         if (!isset($this->records[$interactionId])) {
             $this->records[$interactionId] = [

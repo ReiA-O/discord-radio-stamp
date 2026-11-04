@@ -32,6 +32,9 @@ final class RestStateStore
      */
     private const INTERACTION_ROUTES = ['interaction_edit'];
     private const TOKEN_ROUTE_PREFIX = 'route:interaction_edit:';
+    /** A probe is held at most this long (request timeout plus margin); the next worker may probe after it. */
+    private const PROBE_HOLD = 15.0;
+    private const PROBE_PREFIX = 'probe:';
     public static function openExisting(PDO $pdo):self{return new self($pdo,false);}
 
     /** Structural preflight only; never creates tables, changes journals, or seeds state. */
@@ -106,6 +109,65 @@ final class RestStateStore
         $query = $this->pdo->prepare('INSERT INTO discord_rest_limits(limit_key,until_at) VALUES (?,?) ON CONFLICT(limit_key) DO UPDATE SET until_at=MAX(excluded.until_at,?+MAX(0,' . self::remainingSql('discord_rest_limits.until_at', '(SELECT s.until_at FROM discord_rest_limits s WHERE s.limit_key=?)') . '))');
         $query->execute([self::KEY_PREFIX . $key, $until, $now, $seenKey, $now + self::LEGACY_HORIZON, $now, $seenKey, $now, $seenKey, $now]);
         $this->pdo->prepare('INSERT INTO discord_rest_limits(limit_key,until_at) VALUES (?,?) ON CONFLICT(limit_key) DO UPDATE SET until_at=excluded.until_at')->execute([$seenKey, $now]);
+    }
+    /**
+     * Cooldown plus, while a limit row for this request still exists after it has run out, one probe at a time:
+     * workers check and reserve under BEGIN IMMEDIATE, so concurrent workers never all resend at the moment a limit
+     * ends. The others wait for the probe's answer (its 429 sets the next limit, its 2xx clears the spent rows).
+     * Returns [seconds to wait, probe row keys to hand back to release()].
+     */
+    public function reserve(string $route, float $now, string $major = ''): array
+    {
+        // Ordinary requests (no limit row at all) take no write lock.
+        $wait = $this->cooldown($route, $now, $major);
+        if ($wait > 0 || $this->limitKeys($route, $major) === []) { return [$wait, []]; }
+        $own = !$this->pdo->inTransaction();
+        if ($own) { $this->pdo->exec('BEGIN IMMEDIATE'); }
+        try {
+            $wait = $this->cooldown($route, $now, $major);
+            $probes = [];
+            if ($wait <= 0) {
+                $probePrefix = self::KEY_PREFIX . self::PROBE_PREFIX;
+                // A probe left by a crashed worker expires on its own; one beyond the hold window can only be a clock step.
+                $this->pdo->prepare('DELETE FROM discord_rest_limits WHERE substr(limit_key,1,?)=? AND (until_at<=? OR until_at>?)')->execute([strlen($probePrefix), $probePrefix, $now, $now + self::PROBE_HOLD]);
+                foreach ($this->limitKeys($route, $major) as $key) { $probes[] = $probePrefix . substr($key, strlen(self::KEY_PREFIX)); }
+                if ($probes !== []) {
+                    $marks = implode(',', array_fill(0, count($probes), '?'));
+                    $busy = $this->pdo->prepare("SELECT MAX(until_at) FROM discord_rest_limits WHERE limit_key IN ($marks)");
+                    $busy->execute($probes);
+                    $held = (float) $busy->fetchColumn();
+                    if ($held > $now) { $wait = $held - $now; $probes = []; }
+                    else {
+                        $put = $this->pdo->prepare('INSERT INTO discord_rest_limits(limit_key,until_at) VALUES (?,?) ON CONFLICT(limit_key) DO UPDATE SET until_at=excluded.until_at');
+                        foreach ($probes as $probe) { $put->execute([$probe, $now + self::PROBE_HOLD]); }
+                    }
+                }
+            }
+            if ($own) { $this->pdo->exec('COMMIT'); }
+            return [$wait, $probes];
+        } catch (\Throwable $error) { if ($own) { $this->pdo->exec('ROLLBACK'); } throw $error; }
+    }
+    /** Hands a probe back. After a 2xx the spent limit rows it probed are cleared, so later requests need no probe. */
+    public function release(array $probes, bool $succeeded, float $now): void
+    {
+        if ($probes === []) { return; }
+        $probePrefix = self::KEY_PREFIX . self::PROBE_PREFIX;
+        $drop = $this->pdo->prepare('DELETE FROM discord_rest_limits WHERE limit_key=?');
+        $spent = $this->pdo->prepare('DELETE FROM discord_rest_limits WHERE limit_key=? AND until_at<=?');
+        foreach ($probes as $probe) {
+            $drop->execute([$probe]);
+            if (!$succeeded) { continue; }
+            $tail = substr($probe, strlen($probePrefix));
+            $spent->execute([self::KEY_PREFIX . $tail, $now]);
+            $drop->execute([self::KEY_PREFIX . self::SEEN_PREFIX . $tail]);
+        }
+    }
+    /** v2 limit rows (spent or not) that apply to this request: the same keys cooldown() reads. */
+    private function limitKeys(string $route, string $major): array
+    {
+        $query = $this->pdo->prepare('SELECT limit_key FROM discord_rest_limits WHERE limit_key IN (?, ?, ? || COALESCE((SELECT bucket_key FROM discord_rest_routes WHERE route_key=?), ?)) ORDER BY limit_key');
+        $query->execute([self::KEY_PREFIX . (in_array($route, self::INTERACTION_ROUTES, true) ? 'none' : 'global'), self::KEY_PREFIX . 'route:' . self::routeKey($route, $major), self::KEY_PREFIX, $route, 'none']);
+        return $query->fetchAll(PDO::FETCH_COLUMN);
     }
     /** Atomic per-definition lease and a total cap of three HTTP attempts. */
     public function claimCommand(string $key, float $now): string

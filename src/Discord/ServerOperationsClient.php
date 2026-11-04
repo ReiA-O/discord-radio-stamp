@@ -466,11 +466,11 @@ final class ServerOperationsClient
     private function requestInternal(string $method,string $path,string $route,string $body='',?RoleMutationScope $scope=null,?RoomMutationScope $roomScope=null,?\Closure $lastGuard=null,?OpeningNoticeScope $noticeScope=null):RestResult
     {
         if(!$this->options['enabled']){return new RestResult(false,'operations_disabled',outcome:TransportOutcome::NotStarted);}
-        $exchangeStarted=false;
+        $exchangeStarted=false;$probes=[];$response=null;
         try{
             if(($this->requestGuard)()!==true){return new RestResult(false,'operation_budget_exhausted',outcome:TransportOutcome::NotStarted);}
             if($this->authenticationFailed){return new RestResult(false,'unauthorized',401,[],0,true,TransportOutcome::NotStarted);}
-            if(($wait=$this->limits->cooldown($route,($this->now)()))>0){return new RestResult(false,'rate_limited',429,[],$wait,true,TransportOutcome::NotStarted);}
+            [$wait,$probes]=$this->limits->reserve($route,($this->now)());if($wait>0){return new RestResult(false,'rate_limited',429,[],$wait,true,TransportOutcome::NotStarted);}
             $request=new HttpRequest($method,'https://discord.com/api/v10'.$path,
                 ['Authorization: Bot '.$this->botToken,'Content-Type: application/json','User-Agent: DiscordBot (https://hosting-user.example.invalid, 0.2)'],
                 $body,2000,500,65536,false,$scope,$roomScope,$noticeScope);
@@ -495,6 +495,7 @@ final class ServerOperationsClient
                 :new RestResult(false,match($response->status){401=>'unauthorized',403=>'forbidden',404=>'not_found',429=>'rate_limited',default=>'discord_rejected'},$response->status,[],$response->status===429?$retry:0,
                     outcome:in_array($response->status,[400,401,403,404,405,429],true)?TransportOutcome::Rejected:TransportOutcome::Uncertain);
         }catch(\Throwable $error){$this->diagnostics?->exception('rest_exception',$error);return new RestResult(false,$exchangeStarted?'transport_uncertain':'request_not_started',outcome:$exchangeStarted?TransportOutcome::Uncertain:TransportOutcome::NotStarted);}
+        finally{try{$this->limits->release($probes,$response!==null&&$response->status>=200&&$response->status<300,($this->now)());}catch(\Throwable){}}
     }
 }
 

@@ -202,6 +202,35 @@ try {
     httpCheck($worker->runOnce()['code'] === 'attended', 'retried attendance returns saved core result');
     httpCheck($service->cardData($config['admin_user_ids'][0], '検証担当', '2026-10')['total_count'] === 1, 'worker retry counts attendance once');
     httpCheck($send($attendJob)->status === 200 && $worker->runOnce() === null, 'redelivery after completion does not dispatch twice');
+    // Token lifetime (15 min): never send, or schedule a send, that cannot finish before the token expires.
+    $jobState = static fn(string $id): array => $pdo->query("SELECT state,result_code,token_ciphertext,available_at FROM interaction_jobs WHERE interaction_id='$id'")->fetch();
+    $longWait = $data; $longWait['id'] = '900000000000000231';
+    httpCheck($send($longWait)->status === 200, 'deadline: long-wait job queued');
+    $sink->succeed = false; $sink->failure = new \RadioStamp\Discord\RestResult(false, 'rate_limited', 429, [], 2000.0, true);
+    $result = $worker->runOnce();
+    $row = $jobState($longWait['id']);
+    httpCheck($result['code'] === 'interaction_token_deadline' && $row['state'] === 'expired' && $row['token_ciphertext'] === '', 'rate limit longer than the token lifetime ends the job without another send');
+    $shortWait = $data; $shortWait['id'] = '900000000000000232';
+    httpCheck($send($shortWait)->status === 200, 'deadline: short-wait job queued');
+    $sink->failure = new \RadioStamp\Discord\RestResult(false, 'rate_limited', 429, [], 30.0, true);
+    $sendsBefore = $sink->sends;
+    httpCheck($worker->runOnce()['state'] === 'retry' && (int) $jobState($shortWait['id'])['available_at'] === $clock->now()->getTimestamp() + 30, 'rate limit inside the lifetime waits the full Retry-After');
+    $clock->advance(29); $sink->succeed = true;
+    httpCheck($worker->runOnce() === null && $sink->sends === $sendsBefore + 1, 'no resend before Retry-After ends');
+    $clock->advance(1);
+    httpCheck($worker->runOnce()['state'] === 'done', 'resend after Retry-After succeeds');
+    $gone = $data; $gone['id'] = '900000000000000233';
+    httpCheck($send($gone)->status === 200, 'deadline: unknown-webhook job queued');
+    $sink->succeed = false; $sink->failure = new \RadioStamp\Discord\RestResult(false, 'not_found', 404);
+    $sendsBefore = $sink->sends;
+    httpCheck($worker->runOnce()['code'] === 'interaction_token_deadline' && $jobState($gone['id'])['state'] === 'expired' && $sink->sends === $sendsBefore + 1, '404 unknown webhook is terminal after one request');
+    $late = $data; $late['id'] = '900000000000000234';
+    httpCheck($send($late)->status === 200, 'deadline: late job queued');
+    $sink->succeed = true; $sink->failure = null; $sendsBefore = $sink->sends;
+    $clock->advance(890);
+    httpCheck($worker->runOnce()['code'] === 'interaction_token_deadline' && $sink->sends === $sendsBefore, 'job claimed within the margin of expiry is ended without sending');
+    $clock->advance(-890);
+    unset($sink->records[$shortWait['id']]); // later checks count the original three followups
     $card = $data; $card['id'] = '900000000000000203'; $card['data']['custom_id'] = 'radio:card:2026-10';
     httpCheck($send($card)->status === 200 && $worker->runOnce()['code'] === 'card_ready', 'card button renders through worker');
     httpCheck($sink->records[$card['id']]['png_bytes'] > 1000 && $sink->records[$card['id']]['transport'] === 'mock_only', 'mock card delivery records PNG evidence only');

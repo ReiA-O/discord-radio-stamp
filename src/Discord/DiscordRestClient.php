@@ -240,8 +240,9 @@ final class DiscordRestClient
     {
         if (!$this->enabled) { return new RestResult(false, 'transport_disabled'); }
         if ($botAuth && $this->authenticationFailed) { return new RestResult(false, 'unauthorized', 401, [], 0.0, true); }
+        $probes = []; $response = null;
         try {
-            $now = ($this->now)(); $wait = $this->store->cooldown($route, $now, $major);
+            $now = ($this->now)(); [$wait, $probes] = $this->store->reserve($route, $now, $major);
             if ($wait > 0) { return new RestResult(false, 'rate_limited', 429, [], $wait, true); }
             if ($this->inlineOnly && $this->inlineCalls >= 1) { return new RestResult(false, 'operation_budget_exhausted'); }
             $timeout = $this->timeoutMs;
@@ -295,6 +296,9 @@ final class DiscordRestClient
             $code = match (true) { $response->status === 401 => 'unauthorized', $response->status === 403 => 'forbidden', $response->status === 404 => 'not_found', $response->status === 429 => $invalidRate ? 'rate_limit_invalid' : 'rate_limited', $response->status >= 300 && $response->status < 400 => 'redirect_refused', $response->status >= 500 => 'discord_unavailable', default => 'discord_rejected' };
             return new RestResult(false, $code, $response->status, [], $response->status === 429 ? $retry : 0.0);
         } catch (\Throwable) { return new RestResult(false, 'transport_failed'); }
+        finally {
+            try { $this->store->release($probes, $response !== null && $response->status >= 200 && $response->status < 300, ($this->now)()); } catch (\Throwable) {}
+        }
     }
     private static function snowflake(mixed $value): bool { return is_string($value) && preg_match('/\A[1-9][0-9]{16,19}\z/D', $value) === 1; }
     private static function token(string $value): bool { return preg_match('/\A[A-Za-z0-9._-]{20,256}\z/D', $value) === 1; }

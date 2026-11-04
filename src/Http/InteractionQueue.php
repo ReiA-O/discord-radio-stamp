@@ -199,10 +199,18 @@ final class InteractionQueue
     }
 
     /** Return the owned transition, or null after another worker/expiry took ownership. */
-    public function retry(array $job, string $code, int $now): ?string
+    public function retry(array $job, string $code, int $now, ?int $availableAt = null): ?string
     {
         $statement = $this->pdo->prepare("UPDATE interaction_jobs SET state=CASE WHEN attempts >= 5 THEN 'failed' ELSE 'pending' END, token_ciphertext=CASE WHEN attempts >= 5 THEN '' ELSE token_ciphertext END, result_code=?, available_at=?, lease_id=NULL WHERE interaction_id=? AND state='processing' AND lease_id=? AND attempts=?");
-        $statement->execute([$code, $now + min(60, 2 ** (int) $job['attempts']), $job['interaction_id'], $job['lease_id'], (int)$job['attempts']]);
+        $statement->execute([$code, max($availableAt ?? 0, $now + min(60, 2 ** (int) $job['attempts'])), $job['interaction_id'], $job['lease_id'], (int)$job['attempts']]);
         return $statement->rowCount()===1?((int)$job['attempts']>=5?'failed':'pending'):null;
+    }
+
+    /** The owned job can no longer be answered within its token lifetime: end it like expire(), without another request. */
+    public function abandon(array $job, string $code): bool
+    {
+        $statement = $this->pdo->prepare("UPDATE interaction_jobs SET state='expired', token_ciphertext='', lease_id=NULL, result_code=? WHERE interaction_id=? AND state='processing' AND lease_id=?");
+        $statement->execute([$code, $job['interaction_id'], $job['lease_id']]);
+        return $statement->rowCount() === 1;
     }
 }
