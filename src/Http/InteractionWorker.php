@@ -119,6 +119,8 @@ final class InteractionWorker
 
     private function abandon(array $job):array
     {
+        // An older InteractionQueue (rolling swap) has no abandon(); its claim-time expiry still ends the job.
+        if(!method_exists($this->queue,'abandon')){return $this->retry($job,self::DEADLINE_CODE,$this->clock->now()->getTimestamp());}
         $owned=$this->queue->abandon($job,self::DEADLINE_CODE);
         $code=$owned?self::DEADLINE_CODE:'worker_claim_lost';
         $this->diagnostics?->record('worker_result',['ok'=>false,'code'=>$code]);
