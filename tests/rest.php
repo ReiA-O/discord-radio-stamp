@@ -364,6 +364,12 @@ $workerA->observe('guild', 'guild', [], 429, 5.0, false, $limitNow + 80.0);
 [, $abandoned] = $workerA->reserve('guild', $limitNow + 85.0);
 [$waitB, $probeB] = $workerB->reserve('guild', $limitNow + 85.0 + 15.0);
 restCheck($abandoned !== [] && $waitB === 0.0 && $probeB !== [], 'a probe never handed back expires after its hold');
+$workerB->release($probeB, false, $limitNow + 100.0);
+// A request sent before the limit existed answers 429 (two days) while a probe is out; the probe's 2xx must not drop that limit's seen row.
+[, $probeA] = $workerA->reserve('guild', $limitNow + 100.5);
+$workerB->observe('guild', 'guild', [], 429, 172800.0, false, $limitNow + 101.0);
+$workerA->release($probeA, true, $limitNow + 101.5);
+restCheck($workerB->cooldown('guild', $limitNow + 102.0) === 172799.0, 'a long 429 that lands while a probe is out survives the probe 2xx');
 unset($workerA, $workerB); @unlink($probeFile);
 $probeHttp = new RestFakeHttp([new HttpResponse(429, ['Retry-After' => '30'], '{"retry_after":30,"global":true}'), restJson(['id' => Client::APPLICATION_ID, 'bot' => true]), restJson(['id' => Client::APPLICATION_ID, 'bot' => true])]);
 $probeClientStore = $limitStore(); $probeClient = restClient($probeHttp, ['state_store' => $probeClientStore] + $limitClock);

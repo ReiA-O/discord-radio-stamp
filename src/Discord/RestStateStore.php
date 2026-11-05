@@ -147,19 +147,23 @@ final class RestStateStore
             return [$wait, $probes];
         } catch (\Throwable $error) { if ($own) { $this->pdo->exec('ROLLBACK'); } throw $error; }
     }
-    /** Hands a probe back. After a 2xx the spent limit rows it probed are cleared, so later requests need no probe. */
+    /**
+     * Hands a probe back. After a 2xx the spent limit rows it probed are cleared, so later requests need no probe.
+     * A limit renewed meanwhile (a 429 from a request sent before the probe) keeps its row and its seen row.
+     */
     public function release(array $probes, bool $succeeded, float $now): void
     {
         if ($probes === []) { return; }
         $probePrefix = self::KEY_PREFIX . self::PROBE_PREFIX;
         $drop = $this->pdo->prepare('DELETE FROM discord_rest_limits WHERE limit_key=?');
         $spent = $this->pdo->prepare('DELETE FROM discord_rest_limits WHERE limit_key=? AND until_at<=?');
+        $orphan = $this->pdo->prepare('DELETE FROM discord_rest_limits WHERE limit_key=? AND NOT EXISTS (SELECT 1 FROM discord_rest_limits l WHERE l.limit_key=?)');
         foreach ($probes as $probe) {
             $drop->execute([$probe]);
             if (!$succeeded) { continue; }
             $tail = substr($probe, strlen($probePrefix));
             $spent->execute([self::KEY_PREFIX . $tail, $now]);
-            $drop->execute([self::KEY_PREFIX . self::SEEN_PREFIX . $tail]);
+            $orphan->execute([self::KEY_PREFIX . self::SEEN_PREFIX . $tail, self::KEY_PREFIX . $tail]);
         }
     }
     /** v2 limit rows (spent or not) that apply to this request: the same keys cooldown() reads. */
