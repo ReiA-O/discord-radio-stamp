@@ -197,8 +197,9 @@ try{(static function():void{
     aoCycle($retry);aoSame(1,count($retry['http']->notices()),'backoff prevents immediate retry');
     $retry['clock']->set('@'.aoEffect($retry)['lease_until']);aoCycle($retry);aoCycle($retry);aoSame(2,count($retry['http']->notices()),'known rejection retries once then deduplicates');
     foreach([new HttpResponse(0,[],'','fictional timeout'),new RuntimeException('fictional notice exception')]as$unknown){
-        $f=aoFixture();aoCycle($f);$f['http']->noticeOutcomes=[$unknown];aoDue($f);aoSame(1,count($f['http']->notices()),'uncertain notice is attempted once');aoCheck(aoEffect($f)['lease_owner']!==null,'uncertain notice stays held');
-        $f['clock']->advance(40);$next=$f['runtime']->build($f['config'],static fn():bool=>true);$f['runtime']->cycle($next,static fn():bool=>true);aoSame(1,count($f['http']->notices()),'restart never replays uncertain invitation');
+        // No response: one same-nonce resend inside the same call, then the notice is held.
+        $f=aoFixture();aoCycle($f);$f['http']->noticeOutcomes=[$unknown,$unknown];aoDue($f);aoSame(2,count($f['http']->notices()),'uncertain notice is attempted once plus one same-nonce resend');aoCheck(aoEffect($f)['lease_owner']!==null,'uncertain notice stays held');
+        $f['clock']->advance(40);$next=$f['runtime']->build($f['config'],static fn():bool=>true);$f['runtime']->cycle($next,static fn():bool=>true);aoSame(2,count($f['http']->notices()),'restart never replays uncertain invitation');
     }
 
     // Preserve the final readback/TTL/owner guard even without a room-open done prerequisite.
