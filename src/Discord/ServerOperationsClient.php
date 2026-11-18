@@ -10,6 +10,9 @@ use RadioStamp\Operations\SafeDiagnostics;
 final class ServerOperationsClient
 {
     public const DESTINATION_ID='800000000000001002';
+    /** Ordinary REST calls keep the short budget; channel posts get more time before they become uncertain. */
+    public const DEFAULT_TIMEOUT_MS=2000;
+    public const POST_TIMEOUT_MS=8000;
     private array $options;
     private RestStateStore $limits;
     private bool $authenticationFailed=false;
@@ -332,8 +335,15 @@ final class ServerOperationsClient
         $needsHere=($payload['allowed_mentions']['parse']??[])===['everyone'];
         $noticeScope=$kind==='opening_notice'&&$openingSnapshot!==null&&$noticeClock!==null&&$needsHere
             ?OpeningNoticeScope::fromClaim($this->db,$openingSnapshot,$key,$claim['owner'],$noticeClock):null;
-        $result=$needsHere&&$noticeScope===null?new RestResult(false,'scope_rejected',outcome:TransportOutcome::NotStarted)
-            :$this->request('POST','/channels/'.$channel.'/messages','messages:'.$channel,$json,null,null,$beforeTransport,$noticeScope);
+        $send=fn():RestResult=>$this->request('POST','/channels/'.$channel.'/messages','messages:'.$channel,$json,null,null,$beforeTransport,$noticeScope,self::POST_TIMEOUT_MS);
+        $result=$needsHere&&$noticeScope===null?new RestResult(false,'scope_rejected',outcome:TransportOutcome::NotStarted):$send();
+        // No response at all (timeout or lost connection): resend once with the identical body. The same
+        // nonce with enforce_nonce makes Discord return the already-created message instead of a second one.
+        // Later calls still never resend an uncertain post, because the nonce window is only a few minutes.
+        if(!$result->ok&&$result->code==='transport_uncertain'){
+            $this->diagnostics?->record('rest',['ok'=>false,'code'=>'post_retry_same_nonce','route'=>SafeDiagnostics::route('messages:'.$channel)]);
+            $result=$send();
+        }
         $message=$result->ok&&self::id($result->data['id']??null)&&($result->data['channel_id']??null)===$channel?$result->data['id']:null;
         $outcome=$message!==null?TransportOutcome::Succeeded:($result->outcome->retryable()?$result->outcome:TransportOutcome::Uncertain);
         if(!$this->finish($key,$claim['owner'],$outcome,$message)){return new RestResult(false,'operation_claim_lost');}
@@ -451,11 +461,11 @@ final class ServerOperationsClient
             return $q->rowCount()===1;
         });
     }
-    private function request(string $method,string $path,string $route,string $body='',?RoleMutationScope $scope=null,?RoomMutationScope $roomScope=null,?\Closure $lastGuard=null,?OpeningNoticeScope $noticeScope=null):RestResult
+    private function request(string $method,string $path,string $route,string $body='',?RoleMutationScope $scope=null,?RoomMutationScope $roomScope=null,?\Closure $lastGuard=null,?OpeningNoticeScope $noticeScope=null,int $timeoutMs=self::DEFAULT_TIMEOUT_MS):RestResult
     {
         $started=hrtime(true);
         try{
-            $result=$this->requestInternal($method,$path,$route,$body,$scope,$roomScope,$lastGuard,$noticeScope);
+            $result=$this->requestInternal($method,$path,$route,$body,$scope,$roomScope,$lastGuard,$noticeScope,$timeoutMs);
             $fields=['ok'=>$result->ok,'code'=>$result->code,'status'=>$result->status,'outcome'=>$result->outcome->value,'route'=>SafeDiagnostics::route($route),
                 'duration_ms'=>(int)((hrtime(true)-$started)/1000000)];
             if(preg_match('~/(?:voice-states|members)/([1-9][0-9]{16,19})\z~D',$path,$match)){$fields['actor']=$this->diagnostics?->alias($match[1])??'outside';}
@@ -463,7 +473,7 @@ final class ServerOperationsClient
             return $result;
         }catch(\Throwable $error){$this->diagnostics?->exception('rest_exception',$error);throw $error;}
     }
-    private function requestInternal(string $method,string $path,string $route,string $body='',?RoleMutationScope $scope=null,?RoomMutationScope $roomScope=null,?\Closure $lastGuard=null,?OpeningNoticeScope $noticeScope=null):RestResult
+    private function requestInternal(string $method,string $path,string $route,string $body='',?RoleMutationScope $scope=null,?RoomMutationScope $roomScope=null,?\Closure $lastGuard=null,?OpeningNoticeScope $noticeScope=null,int $timeoutMs=self::DEFAULT_TIMEOUT_MS):RestResult
     {
         if(!$this->options['enabled']){return new RestResult(false,'operations_disabled',outcome:TransportOutcome::NotStarted);}
         $exchangeStarted=false;$probes=[];$response=null;
@@ -473,7 +483,7 @@ final class ServerOperationsClient
             [$wait,$probes]=method_exists($this->limits,'reserve')?$this->limits->reserve($route,($this->now)()):[$this->limits->cooldown($route,($this->now)()),[]];if($wait>0){return new RestResult(false,'rate_limited',429,[],$wait,true,TransportOutcome::NotStarted);}
             $request=new HttpRequest($method,'https://discord.com/api/v10'.$path,
                 ['Authorization: Bot '.$this->botToken,'Content-Type: application/json','User-Agent: DiscordBot (https://hosting-user.example.invalid, 0.2)'],
-                $body,2000,500,65536,false,$scope,$roomScope,$noticeScope);
+                $body,$timeoutMs,500,65536,false,$scope,$roomScope,$noticeScope);
             // Database/cooldown work may use up a budget. The source guard is the last check before transport.
             if(($this->requestGuard)()!==true){return new RestResult(false,'operation_budget_exhausted',outcome:TransportOutcome::NotStarted);}
             if($lastGuard!==null&&$lastGuard()!==true){return new RestResult(false,'source_generation_changed',0,[],0,true,TransportOutcome::NotStarted);}

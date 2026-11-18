@@ -70,12 +70,32 @@ $same($before+1,count($http->calls),'rejections have no HTTP side effects');
 
 [$db,$http,$client]=operationsFixture(['enabled'=>true,'posts_enabled'=>true]);$http->failPost=true;
 $same(false,$client->postReceipt($session,$deadline,'lost')->ok,'lost response held');
+$same(2,count($http->calls),'a lost post is resent once in the same call');
+$same($http->calls[0]->body(),$http->calls[1]->body(),'the resend reuses the identical body and nonce');
 $http->failPost=false;$same(false,$client->postReceipt($session,$deadline,'retry')->ok,'uncertain response never auto-retried');
-$same(1,count($http->calls),'one attempt after uncertainty');
+$same(2,count($http->calls),'no attempt after uncertainty is recorded');
 $same('uncertain',$db->pdo()->query('SELECT status FROM operation_receipts')->fetchColumn(),'uncertain state persisted');
 $db->pdo()->exec("UPDATE operation_receipts SET status='sending'");
 $restarted=new ServerOperationsClient($db,$http,'fictional_operations_bot_token_00000',['enabled'=>true,'posts_enabled'=>true]);
-$same(false,$restarted->postReceipt($session,$deadline,'restart')->ok,'interrupted send not retried after restart');$same(1,count($http->calls),'restart adds no POST');
+$same(false,$restarted->postReceipt($session,$deadline,'restart')->ok,'interrupted send not retried after restart');$same(2,count($http->calls),'restart adds no POST');
+
+// 2026-11-19: the receipt post timed out although Discord had created it. One same-nonce resend recovers it.
+[$db,$http,$client]=operationsFixture(['enabled'=>true,'posts_enabled'=>true]);
+$http->next=new HttpResponse(0,[],'','transport_timeout');
+$recovered=$client->postReceipt($session,$deadline,'timeout-then-ok');
+$same(true,$recovered->ok,'timeout followed by the nonce resend is confirmed');
+$same('900000000000009999',$recovered->data['message_id'],'the returned message ID is kept');
+$same(2,count($http->calls),'exactly one resend');
+$same($http->calls[0]->body(),$http->calls[1]->body(),'resend body is identical');
+$same(ServerOperationsClient::POST_TIMEOUT_MS,$http->calls[0]->timeoutMs,'posts use the longer timeout');
+$same('sent',$db->pdo()->query('SELECT status FROM operation_receipts')->fetchColumn(),'receipt recorded as sent');
+$same('already_sent',$client->postReceipt($session,$deadline,'again')->code,'later call does not post again');$same(2,count($http->calls),'no third POST');
+$same(ServerOperationsClient::DEFAULT_TIMEOUT_MS,(function()use($client,$http,$user){$client->readVoice($user);return end($http->calls)->timeoutMs;})(),'other REST keeps the short timeout');
+
+// A definite rejection (HTTP status) is never resent.
+[$db,$http,$client]=operationsFixture(['enabled'=>true,'posts_enabled'=>true]);
+$http->next=new HttpResponse(403,[],'{}');
+$same(false,$client->postReceipt($session,$deadline,'forbidden')->ok,'rejected post fails');$same(1,count($http->calls),'rejection is not resent');
 
 $options=['enabled'=>true,'posts_enabled'=>true,'roles_enabled'=>true,'role_ids'=>[1=>'900000000000000141',40=>'900000000000000142']];
 [$db,$http,$client]=operationsFixture($options);

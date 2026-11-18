@@ -134,8 +134,10 @@ try{(static function():void{
     $blockNotice=false;$notStarted['clock']->advance(5);onCycle($notStarted);onSame(1,count($notStarted['http']->notices()),'known not-started may later retry once inside window');
 
     foreach([new HttpResponse(0,[],'','fictional timeout'),new RuntimeException('fictional post throw'),new HttpResponse(200,[],'{"id":"invalid"}')]as$unknown){
-        $f=onFixture();onCycle($f);$f['http']->noticeOutcomes=[$unknown];onDue($f);onSame(1,count($f['http']->notices()),'uncertain attempted POST is observed once');onCheck(onEffect($f)['lease_owner']!==null,'uncertain attempt is held with owner');
-        $f['clock']->advance(40);$next=$f['runtime']->build($f['config'],static fn():bool=>true);$f['runtime']->cycle($next,static fn():bool=>true);onSame(1,count($f['http']->notices()),'elapsed old lease and restart cannot replay an uncertain POST');
+        // No HTTP response (timeout/throw) gets exactly one same-nonce resend inside the same call; an answered but invalid success does not.
+        $posts=$unknown instanceof HttpResponse&&$unknown->status!==0?1:2;
+        $f=onFixture();onCycle($f);$f['http']->noticeOutcomes=[$unknown,$unknown];onDue($f);onSame($posts,count($f['http']->notices()),'uncertain attempted POST is observed once (plus one same-nonce resend after no response)');onCheck(onEffect($f)['lease_owner']!==null,'uncertain attempt is held with owner');
+        $f['clock']->advance(40);$next=$f['runtime']->build($f['config'],static fn():bool=>true);$f['runtime']->cycle($next,static fn():bool=>true);onSame($posts,count($f['http']->notices()),'elapsed old lease and restart cannot replay an uncertain POST');
         onCheck(count($f['http']->messagesTo(DiscordRestClient::VOICE_CHANNEL_ID))>=1,'held notice does not prevent ordinary VC guide');
     }
     $save=onFixture();onCycle($save);$save['http']->noticeHook=static function()use($save):void{$save['context']->db->pdo()->exec("CREATE TRIGGER fictional_open_save_failure BEFORE UPDATE OF status ON core_effects WHEN NEW.kind='opening_notice' AND NEW.status='done' BEGIN SELECT RAISE(ABORT,'fictional save failure'); END");};
